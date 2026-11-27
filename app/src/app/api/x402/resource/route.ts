@@ -2,6 +2,11 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import { createHash, randomBytes } from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 import {
+  claimAtomicKey,
+  getAtomicStoreMode,
+  peekKeyTtlSeconds,
+} from "@/lib/kv-store";
+import {
   DEFAULT_DEVNET_RPC,
   DEVNET_USDC_MINT,
   LEASH_PROGRAM_ID,
@@ -17,29 +22,12 @@ import {
 } from "@/lib/leash-protocol";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 
 const RESOURCE_PATH = "/api/x402/resource";
-const REDEEMED_RECEIPT_TTL_MS = 30 * 60 * 1000; // 30 minutes (> 300-slot Receipt TTL)
+const REDEEMED_RECEIPT_TTL_SECONDS = 30 * 60; // 30 minutes (> 300-slot Receipt TTL)
 
 export type MintVerificationMode = "strict_expected_mint" | "sandbox_mock_mint";
-
-// NOTE: In-memory TTL-pruned single-use replay store suitable for single-instance / demo servers.
-// Multi-instance serverless production deployments (e.g., Vercel multi-region) MUST swap this Map
-// for an atomic shared store such as Upstash Redis / Vercel KV (`SET receipt:<hash> 1 NX PX ...`).
-const globalForReplay = globalThis as unknown as {
-  __leashRedeemedReceipts?: Map<string, number>;
-};
-const redeemedReceipts: Map<string, number> =
-  globalForReplay.__leashRedeemedReceipts ?? new Map<string, number>();
-globalForReplay.__leashRedeemedReceipts = redeemedReceipts;
-
-function pruneRedeemedReceipts(nowMs: number): void {
-  for (const [hash, expiresAt] of redeemedReceipts.entries()) {
-    if (expiresAt <= nowMs) {
-      redeemedReceipts.delete(hash);
-    }
-  }
-}
 
 function getConfiguredExpectedMint(): PublicKey {
   const raw = process.env.EXPECTED_MINT?.trim();
@@ -87,6 +75,7 @@ function paymentRequiredResponse(params: {
       reason:
         params.reason ??
         "Submit an on-chain Leash execute_agent_spend transaction settling this challenge and retry with X-402-Vault, X-402-Mint, X-402-Nonce, and X-402-Tx-Signature headers.",
+      replayStore: getAtomicStoreMode(),
       challenge: {
         version: "x402-leash-v2",
         cluster: "devnet",
@@ -197,11 +186,11 @@ export async function GET(request: NextRequest) {
     expectedMint,
     nonceHeader
   );
+  const replayKey = `leash:x402:receipt:${hashHex}`;
 
-  // Single-use replay check before accepting settlement
-  const nowMs = Date.now();
-  pruneRedeemedReceipts(nowMs);
-  if (redeemedReceipts.has(hashHex)) {
+  // Pre-RPC fast check: reject already-redeemed Receipt without burning RPC calls
+  const alreadyRedeemed = await peekKeyTtlSeconds(replayKey);
+  if (alreadyRedeemed.exists) {
     return paymentRequiredResponse({
       mint: expectedMint,
       mintVerificationMode,
@@ -231,7 +220,6 @@ export async function GET(request: NextRequest) {
       connection.getSlot("confirmed"),
     ]);
 
-    // 1. Verify Receipt PDA exists and is owned by Leash program
     if (!receiptAccount) {
       return paymentRequiredResponse({
         mint: expectedMint,
@@ -250,7 +238,6 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // 2. Verify Vault PDA exists, is owned by Leash program, and settles expectedMint
     if (!vaultAccount) {
       return paymentRequiredResponse({
         mint: expectedMint,
@@ -357,8 +344,9 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // Re-check and atomically mark Receipt request_hash as redeemed (single-use enforcement)
-    if (redeemedReceipts.has(hashHex)) {
+    // Atomic serverless SET key "1" EX ttl NX claim across concurrent instances
+    const claim = await claimAtomicKey(replayKey, REDEEMED_RECEIPT_TTL_SECONDS);
+    if (!claim.acquired) {
       return paymentRequiredResponse({
         mint: expectedMint,
         mintVerificationMode,
@@ -366,7 +354,6 @@ export async function GET(request: NextRequest) {
         reason: "Receipt already redeemed — single-use x402 settlement enforced.",
       });
     }
-    redeemedReceipts.set(hashHex, Date.now() + REDEEMED_RECEIPT_TTL_MS);
 
     return NextResponse.json(
       {
@@ -381,6 +368,7 @@ export async function GET(request: NextRequest) {
           merchant: decodedReceipt.merchant.toBase58(),
           mint: decodedVault.mint.toBase58(),
           mintVerificationMode,
+          replayStore: claim.storeMode,
           amountSettled: decodedReceipt.amount.toString(),
           canonicalPreimage: preimage,
           requestHashHex: decodedReceipt.requestHashHex,
@@ -393,7 +381,7 @@ export async function GET(request: NextRequest) {
           feed: "solana-x402-autonomous-execution-signal",
           timestamp: new Date().toISOString(),
           settlementGuarantee:
-            "Verified directly via canonical on-chain Leash Vault + Receipt PDAs (immune to fake-mint, soft-trip, and replay spoofing).",
+            "Verified directly via canonical on-chain Leash Vault + Receipt PDAs and atomic SET NX EX replay guard.",
           signal: {
             pair: "SOL/USDC",
             regime: "LOW_VOLATILITY_EXECUTION_OK",

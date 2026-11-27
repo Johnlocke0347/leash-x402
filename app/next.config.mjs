@@ -7,7 +7,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nextConfig = {
   reactStrictMode: true,
   outputFileTracingRoot: __dirname,
-  webpack: (config, { isServer }) => {
+  webpack: (config, { isServer, webpack }) => {
     if (!isServer) {
       config.resolve.fallback = {
         ...config.resolve.fallback,
@@ -15,7 +15,13 @@ const nextConfig = {
         os: false,
         path: false,
         crypto: false,
+        buffer: path.resolve(__dirname, "node_modules/buffer/"),
       };
+      config.plugins.push(
+        new webpack.ProvidePlugin({
+          Buffer: ["buffer", "Buffer"],
+        })
+      );
     }
     return config;
   },

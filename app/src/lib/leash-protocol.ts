@@ -1,3 +1,4 @@
+import { Buffer } from "buffer";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
@@ -8,6 +9,10 @@ import {
   TransactionInstruction,
 } from "@solana/web3.js";
 import leashIdl from "./leash-idl.json";
+
+if (typeof globalThis !== "undefined" && !globalThis.Buffer) {
+  globalThis.Buffer = Buffer;
+}
 
 export const DEFAULT_DEVNET_RPC =
   process.env.NEXT_PUBLIC_SOLANA_RPC_URL || "https://api.devnet.solana.com";

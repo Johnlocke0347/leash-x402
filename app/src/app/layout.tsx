@@ -4,7 +4,7 @@ import "./globals.css";
 
 const plexSans = IBM_Plex_Sans({
   subsets: ["latin"],
-  weight: ["400", "500", "600"],
+  weight: ["400", "500", "600", "700"],
   variable: "--font-sans",
 });
 
@@ -15,9 +15,9 @@ const plexMono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Leash Judge Sandbox — Solana x402 Spending Control Plane & Circuit Breaker",
+  title: "Leash — Solana x402 Circuit Breaker | Non-Custodial AI Agent Vault",
   description:
-    "Interactive Solana Devnet adversarial verification workbench for Leash: non-custodial payer-side spending policies, leaky-bucket rate limits, and Receipt PDA x402 verification.",
+    "Leash — Solana x402 Circuit Breaker: non-custodial payer-side SPL spending vault, non-reverting prompt-injection circuit breaker, and canonical Receipt PDA verifier for autonomous AI agents.",
 };
 
 export default function RootLayout({

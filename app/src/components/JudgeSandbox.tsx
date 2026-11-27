@@ -52,13 +52,33 @@ const AGENT_STIPEND_SOL = 0.015;
 
 type LogTone = "ok" | "trip" | "warn";
 
-interface SandboxLogEntry {
+interface ServerStatusPayload {
+  programId: string;
+  cluster: string;
+  rpcMode: "custom_rpc" | "public_devnet";
+  faucet: {
+    configured: boolean;
+    pubkey?: string;
+    balanceSol?: number;
+  };
+  replayStore: "upstash_redis" | "in_memory_fallback";
+  mintPolicy: {
+    mode: "sandbox_mock_mint" | "strict_usdc";
+    expectedMint: string;
+  };
+}
+
+interface TraceLogEntry {
   id: string;
   timestamp: string;
   title: string;
+  badgeLabel: string;
   tone: LogTone;
+  deltaSummary: string;
+  mintSummary: string;
+  receiptSummary: string;
   txSig?: string;
-  detail: string;
+  rawJson: string;
 }
 
 interface RedeemedReceiptContext {
@@ -66,6 +86,7 @@ interface RedeemedReceiptContext {
   mint: string;
   nonce: string;
   txSig: string;
+  receiptPda: string;
 }
 
 function loadOrCreateBrowserKeypair(storageKey: string): Keypair {
@@ -86,6 +107,11 @@ function loadOrCreateBrowserKeypair(storageKey: string): Keypair {
     JSON.stringify(Array.from(fresh.secretKey))
   );
   return fresh;
+}
+
+function shortKey(key: string): string {
+  if (key.length <= 14) return key;
+  return `${key.slice(0, 6)}...${key.slice(-6)}`;
 }
 
 function explorerTxUrl(sig: string): string {
@@ -139,9 +165,12 @@ async function signAndConfirmBrowserTx(
 
 export default function JudgeSandbox() {
   const [rpcUrl, setRpcUrl] = useState<string>(DEFAULT_DEVNET_RPC);
+  const [serverStatus, setServerStatus] = useState<ServerStatusPayload | null>(
+    null
+  );
+
   const [ownerKeypair, setOwnerKeypair] = useState<Keypair | null>(null);
   const [agentKeypair, setAgentKeypair] = useState<Keypair | null>(null);
-
   const [ownerSol, setOwnerSol] = useState<number>(0);
   const [agentSol, setAgentSol] = useState<number>(0);
   const [faucetThrottled, setFaucetThrottled] = useState<boolean>(false);
@@ -158,20 +187,22 @@ export default function JudgeSandbox() {
   const [verifiedMintMode, setVerifiedMintMode] = useState<string | null>(null);
   const [lastRedeemed, setLastRedeemed] =
     useState<RedeemedReceiptContext | null>(null);
-
-  const [nowSec, setNowSec] = useState<bigint>(
-    BigInt(Math.floor(Date.now() / 1000))
+  const [completedSteps, setCompletedSteps] = useState<Record<number, boolean>>(
+    {}
   );
+
+  // Hydration-safe clock state: initialized to 0n on SSR and populated on client mount
+  const [nowSec, setNowSec] = useState<bigint>(0n);
   const [busyAction, setBusyAction] = useState<string | null>(null);
-  const [logs, setLogs] = useState<SandboxLogEntry[]>([]);
+  const [logs, setLogs] = useState<TraceLogEntry[]>([]);
 
   const connection = useMemo(
     () => new Connection(rpcUrl, "confirmed"),
     [rpcUrl]
   );
 
-  const appendLog = useCallback(
-    (entry: Omit<SandboxLogEntry, "id" | "timestamp">) => {
+  const appendTrace = useCallback(
+    (entry: Omit<TraceLogEntry, "id" | "timestamp">) => {
       setLogs((prev) => [
         {
           ...entry,
@@ -184,11 +215,28 @@ export default function JudgeSandbox() {
     []
   );
 
+  const markStepDone = useCallback((stepNum: number) => {
+    setCompletedSteps((prev) => ({ ...prev, [stepNum]: true }));
+  }, []);
+
+  const fetchServerStatus = useCallback(async () => {
+    try {
+      const res = await fetch("/api/status", { cache: "no-store" });
+      if (res.ok) {
+        const data = (await res.json()) as ServerStatusPayload;
+        setServerStatus(data);
+      }
+    } catch {
+      // Ignore transient network errors
+    }
+  }, []);
+
   useEffect(() => {
     const owner = loadOrCreateBrowserKeypair(LS_OWNER_KEY);
     const agent = loadOrCreateBrowserKeypair(LS_AGENT_KEY);
     setOwnerKeypair(owner);
     setAgentKeypair(agent);
+    setNowSec(BigInt(Math.floor(Date.now() / 1000)));
 
     const savedSession = window.localStorage.getItem(LS_ACTIVE_SESSION_KEY);
     if (savedSession) {
@@ -198,7 +246,9 @@ export default function JudgeSandbox() {
         // Ignore stale entry
       }
     }
-  }, []);
+
+    void fetchServerStatus();
+  }, [fetchServerStatus]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -207,82 +257,127 @@ export default function JudgeSandbox() {
     return () => window.clearInterval(timer);
   }, []);
 
-  const refreshOnChainState = useCallback(async () => {
-    if (!ownerKeypair || !agentKeypair) return;
-    try {
-      const [vaultPda] = deriveVaultPda(ownerKeypair.publicKey);
-      const [ownerLamports, agentLamports, vaultAccInfo] = await Promise.all([
-        connection.getBalance(ownerKeypair.publicKey, "confirmed"),
-        connection.getBalance(agentKeypair.publicKey, "confirmed"),
-        connection.getAccountInfo(vaultPda, "confirmed"),
-      ]);
-
-      setOwnerSol(ownerLamports / LAMPORTS_PER_SOL);
-      setAgentSol(agentLamports / LAMPORTS_PER_SOL);
-
-      if (!vaultAccInfo) {
-        setVaultState(null);
-        setVaultUsdcBalance(0n);
-        setSessionState(null);
-        return;
-      }
-
-      const decodedVault = decodeVault(
-        vaultPda,
-        new Uint8Array(vaultAccInfo.data)
-      );
-      setVaultState(decodedVault);
-
-      const vaultTokenBal = await connection
-        .getTokenAccountBalance(decodedVault.vaultAta, "confirmed")
-        .catch(() => null);
-      setVaultUsdcBalance(
-        vaultTokenBal ? BigInt(vaultTokenBal.value.amount) : 0n
-      );
-
-      let targetSession = activeSessionAddress;
-      if (!targetSession && decodedVault.sessionNonce > 0n) {
-        targetSession = deriveSessionPda(
-          vaultPda,
-          decodedVault.sessionNonce - 1n
-        )[0];
-        setActiveSessionAddress(targetSession);
-      }
-
-      if (targetSession) {
-        const sessInfo = await connection.getAccountInfo(
-          targetSession,
+  const refreshOnChainState = useCallback(
+    async (overrideSession?: PublicKey) => {
+      if (!ownerKeypair || !agentKeypair) return;
+      try {
+        const [vaultPda] = deriveVaultPda(ownerKeypair.publicKey);
+        const primaryInfos = await connection.getMultipleAccountsInfo(
+          [ownerKeypair.publicKey, agentKeypair.publicKey, vaultPda],
           "confirmed"
         );
-        if (sessInfo) {
-          setSessionState(
-            decodeSession(targetSession, new Uint8Array(sessInfo.data))
-          );
-          setSessionReaped(false);
-        } else {
+
+        const ownerLamports = primaryInfos[0]?.lamports ?? 0;
+        const agentLamports = primaryInfos[1]?.lamports ?? 0;
+        const vaultAccInfo = primaryInfos[2];
+
+        setOwnerSol(ownerLamports / LAMPORTS_PER_SOL);
+        setAgentSol(agentLamports / LAMPORTS_PER_SOL);
+
+        if (!vaultAccInfo) {
+          setVaultState(null);
+          setVaultUsdcBalance(0n);
           setSessionState(null);
-          if (decodedVault.sessionNonce > 0n) {
-            setSessionReaped(true);
+          return;
+        }
+
+        const decodedVault = decodeVault(
+          vaultPda,
+          new Uint8Array(vaultAccInfo.data)
+        );
+        setVaultState(decodedVault);
+
+        let targetSession = overrideSession ?? activeSessionAddress;
+        if (!targetSession && decodedVault.sessionNonce > 0n) {
+          targetSession = deriveSessionPda(
+            vaultPda,
+            decodedVault.sessionNonce - 1n
+          )[0];
+          setActiveSessionAddress(targetSession);
+        }
+
+        const secondaryKeys = targetSession
+          ? [decodedVault.vaultAta, targetSession]
+          : [decodedVault.vaultAta];
+        const secondaryInfos = await connection.getMultipleAccountsInfo(
+          secondaryKeys,
+          "confirmed"
+        );
+
+        const vaultAtaInfo = secondaryInfos[0];
+        if (vaultAtaInfo && vaultAtaInfo.data.length >= 72) {
+          const ataBytes = new Uint8Array(vaultAtaInfo.data);
+          const ataView = new DataView(
+            ataBytes.buffer,
+            ataBytes.byteOffset,
+            ataBytes.byteLength
+          );
+          setVaultUsdcBalance(ataView.getBigUint64(64, true));
+        } else {
+          setVaultUsdcBalance(0n);
+        }
+
+        if (targetSession) {
+          const sessInfo = secondaryInfos[1];
+          if (sessInfo) {
+            setSessionState(
+              decodeSession(targetSession, new Uint8Array(sessInfo.data))
+            );
+            setSessionReaped(false);
+          } else {
+            setSessionState(null);
+            if (decodedVault.sessionNonce > 0n) {
+              setSessionReaped(true);
+            }
           }
         }
+      } catch {
+        // Silent background poll resilience
       }
-    } catch {
-      // Silent background poll resilience
-    }
-  }, [ownerKeypair, agentKeypair, connection, activeSessionAddress]);
+    },
+    [ownerKeypair, agentKeypair, connection, activeSessionAddress]
+  );
 
   useEffect(() => {
     void refreshOnChainState();
+  }, [refreshOnChainState]);
+
+  useEffect(() => {
+    if (busyAction !== null) return;
     const poll = window.setInterval(() => {
       void refreshOnChainState();
-    }, 5000);
+    }, 15000);
     return () => window.clearInterval(poll);
-  }, [refreshOnChainState]);
+  }, [refreshOnChainState, busyAction]);
 
   const handleCopy = async (label: string, value: string) => {
     await navigator.clipboard.writeText(value);
     setCopiedLabel(label);
     window.setTimeout(() => setCopiedLabel(null), 1600);
+  };
+
+  const handleResetSession = () => {
+    window.localStorage.removeItem(LS_ACTIVE_SESSION_KEY);
+    setActiveSessionAddress(null);
+    setSessionState(null);
+    setSessionReaped(false);
+    setLastRedeemed(null);
+    setCompletedSteps({});
+    appendTrace({
+      title: "Mission Control Reset — Ready for New Session",
+      badgeLabel: "SESSION RESET",
+      tone: "warn",
+      deltaSummary: "0.00 USDC",
+      mintSummary: vaultState ? shortKey(vaultState.mint.toBase58()) : "—",
+      receiptSummary: "Cleared",
+      rawJson: JSON.stringify(
+        {
+          note: "Click Step 1 to open a fresh bounded Session on your existing Vault (or rotate ephemeral keys to create a brand-new Vault).",
+        },
+        null,
+        2
+      ),
+    });
   };
 
   const handleRotateKeys = () => {
@@ -299,21 +394,35 @@ export default function JudgeSandbox() {
     window.localStorage.removeItem(LS_ACTIVE_SESSION_KEY);
     setOwnerKeypair(newOwner);
     setAgentKeypair(newAgent);
+    setOwnerSol(0);
+    setAgentSol(0);
     setVaultState(null);
+    setVaultUsdcBalance(0n);
     setSessionState(null);
     setActiveSessionAddress(null);
     setSessionReaped(false);
     setVerifiedMint(null);
     setVerifiedMintMode(null);
     setLastRedeemed(null);
-    appendLog({
+    setCompletedSteps({});
+    appendTrace({
       title: "Rotated Ephemeral Browser Keypairs",
+      badgeLabel: "NEW KEYS",
       tone: "warn",
-      detail: `New Owner: ${newOwner.publicKey.toBase58()}\nNew Agent: ${newAgent.publicKey.toBase58()}`,
+      deltaSummary: "0.00 SOL",
+      mintSummary: "—",
+      receiptSummary: "—",
+      rawJson: JSON.stringify(
+        {
+          newOwner: newOwner.publicKey.toBase58(),
+          newAgent: newAgent.publicKey.toBase58(),
+        },
+        null,
+        2
+      ),
     });
   };
 
-  // Judge-proof Devnet funding: tries server /api/faucet first (0.05 SOL), then falls back to RPC requestAirdrop
   const fundWalletWithFallback = useCallback(
     async (
       pubkey: PublicKey,
@@ -329,13 +438,22 @@ export default function JudgeSandbox() {
 
         if (faucetRes.ok && (faucetBody.funded || faucetBody.skipped)) {
           setFaucetThrottled(false);
-          appendLog({
+          void fetchServerStatus();
+          appendTrace({
             title: faucetBody.funded
-              ? `Server Faucet Funded ${roleLabel} (+${faucetBody.amountSol} SOL)`
-              : `Server Faucet Check (${roleLabel})`,
+              ? `Server Faucet Drip Confirmed (${roleLabel})`
+              : `Server Faucet Balance Check (${roleLabel})`,
+            badgeLabel: faucetBody.funded
+              ? `+${faucetBody.amountSol} SOL`
+              : "SUFFICIENT SOL",
             tone: "ok",
+            deltaSummary: faucetBody.funded
+              ? `+${faucetBody.amountSol} SOL`
+              : "0.00 SOL (skipped)",
+            mintSummary: "Native SOL",
+            receiptSummary: faucetBody.storeMode ?? "atomic_cooldown",
             txSig: faucetBody.txSignature,
-            detail: JSON.stringify(faucetBody, null, 2),
+            rawJson: JSON.stringify(faucetBody, null, 2),
           });
           return { ok: true, txSig: faucetBody.txSignature };
         }
@@ -361,32 +479,52 @@ export default function JudgeSandbox() {
           }
         }
         setFaucetThrottled(false);
-        appendLog({
-          title: `Devnet RPC Airdrop Confirmed (${roleLabel}: +0.50 SOL)`,
+        appendTrace({
+          title: `Devnet RPC Airdrop Confirmed (${roleLabel})`,
+          badgeLabel: "+0.50 SOL",
           tone: "ok",
+          deltaSummary: "+0.50 SOL",
+          mintSummary: "Native SOL",
+          receiptSummary: "—",
           txSig: sig,
-          detail: `Recipient: ${pubkey.toBase58()}`,
+          rawJson: JSON.stringify(
+            { recipient: pubkey.toBase58(), amountSol: 0.5 },
+            null,
+            2
+          ),
         });
         return { ok: true, txSig: sig };
       } catch (err: unknown) {
         setFaucetThrottled(true);
         const msg = err instanceof Error ? err.message : String(err);
-        appendLog({
-          title: `Devnet Faucet Fallback Required (${roleLabel})`,
+        appendTrace({
+          title: `Manual Devnet Faucet Required (${roleLabel})`,
+          badgeLabel: "HTTP 503 / 429",
           tone: "warn",
-          detail: `Server /api/faucet unconfigured (503) and public RPC throttled: ${msg}\nCopy ${pubkey.toBase58()} and request Devnet SOL at https://faucet.solana.com.`,
+          deltaSummary: "0.00 SOL",
+          mintSummary: "—",
+          receiptSummary: "Fallback: faucet.solana.com",
+          rawJson: JSON.stringify(
+            {
+              recipient: pubkey.toBase58(),
+              detail: msg,
+              fallbackUrl: "https://faucet.solana.com",
+            },
+            null,
+            2
+          ),
         });
         return { ok: false };
       }
     },
-    [appendLog, connection]
+    [appendTrace, connection, fetchServerStatus]
   );
 
-  const handleAirdrop = async (target: "owner" | "agent") => {
+  const handleManualFund = async (target: "owner" | "agent") => {
     if (!ownerKeypair || !agentKeypair) return;
     const pubkey =
       target === "owner" ? ownerKeypair.publicKey : agentKeypair.publicKey;
-    setBusyAction(`airdrop-${target}`);
+    setBusyAction(`fund-${target}`);
     try {
       await fundWalletWithFallback(pubkey, target.toUpperCase());
       await refreshOnChainState();
@@ -395,12 +533,11 @@ export default function JudgeSandbox() {
     }
   };
 
-  // ACTION 1: Setup Demo Vault & Session (total setup + agent stipend < 0.04 SOL)
-  const handleSetupDemo = async () => {
+  // STEP 1: Setup Demo Vault & Session (< 0.04 SOL total including Agent stipend)
+  const handleStep1Setup = async () => {
     if (!ownerKeypair || !agentKeypair) return;
-    setBusyAction("setup");
+    setBusyAction("step-1");
     try {
-      // Auto-fund Owner via /api/faucet -> requestAirdrop if balance < 0.035 SOL
       const initialOwnerLamports = await connection.getBalance(
         ownerKeypair.publicKey,
         "confirmed"
@@ -420,21 +557,15 @@ export default function JudgeSandbox() {
           postFundLamports < Math.floor(0.03 * LAMPORTS_PER_SOL)
         ) {
           throw new Error(
-            `Owner wallet (${ownerKeypair.publicKey.toBase58()}) needs >= 0.04 Devnet SOL. Click "Copy Pubkey" above and request SOL at https://faucet.solana.com.`
+            `Owner wallet (${ownerKeypair.publicKey.toBase58()}) needs >= 0.04 Devnet SOL. Copy the Owner pubkey above and fund via https://faucet.solana.com.`
           );
         }
       }
 
-      const programInfo = await connection.getAccountInfo(
-        LEASH_PROGRAM_ID,
+      const preSetupOwnerLamports = await connection.getBalance(
+        ownerKeypair.publicKey,
         "confirmed"
       );
-      if (!programInfo) {
-        throw new Error(
-          `Leash program (${LEASH_PROGRAM_ID.toBase58()}) was not found on this RPC endpoint.`
-        );
-      }
-
       const currentAgentLamports = await connection.getBalance(
         agentKeypair.publicKey,
         "confirmed"
@@ -450,7 +581,6 @@ export default function JudgeSandbox() {
       let mintPubkey: PublicKey;
       let vaultAta: PublicKey;
       let nextNonce = 0n;
-      let setupTxSig = "";
 
       if (!existingVaultInfo) {
         const mintKeypair = Keypair.generate();
@@ -585,14 +715,21 @@ export default function JudgeSandbox() {
           bucketCap: 1_500_000n, // 1.50 USDC
           windowSecs: 30n, // 30s continuous refill window
           lifetimeCap: 5_000_000n, // 5.00 USDC
-          idleTimeoutSecs: 15n, // 15s idle timeout for fast Judge reap testing
+          idleTimeoutSecs: 120n, // 120s idle timeout
         })
       );
-      setupTxSig = await signAndConfirmBrowserTx(
+      const setupTxSig = await signAndConfirmBrowserTx(
         connection,
         sessionTx,
         ownerKeypair
       );
+
+      const postSetupOwnerLamports = await connection.getBalance(
+        ownerKeypair.publicKey,
+        "confirmed"
+      );
+      const setupSolSpent =
+        (preSetupOwnerLamports - postSetupOwnerLamports) / LAMPORTS_PER_SOL;
 
       window.localStorage.setItem(
         LS_ACTIVE_SESSION_KEY,
@@ -600,25 +737,30 @@ export default function JudgeSandbox() {
       );
       setActiveSessionAddress(sessionPda);
       setSessionReaped(false);
-      await refreshOnChainState();
+      setLastRedeemed(null);
+      await refreshOnChainState(sessionPda);
+      setCompletedSteps({ 1: true });
 
-      appendLog({
-        title: "1. Setup Demo Vault & Session Confirmed",
+      appendTrace({
+        title: "Step 1 · Demo Vault & Bounded Session Initialized",
+        badgeLabel: "ON-CHAIN READY",
         tone: "ok",
+        deltaSummary: `+10.00 MockUSDC minted (${setupSolSpent.toFixed(4)} SOL setup)`,
+        mintSummary: `${shortKey(mintPubkey.toBase58())} (Sandbox MockUSDC)`,
+        receiptSummary: `Session #${nextNonce.toString()} Active`,
         txSig: setupTxSig,
-        detail: JSON.stringify(
+        rawJson: JSON.stringify(
           {
             vaultPda: vaultPda.toBase58(),
             sessionPda: sessionPda.toBase58(),
             mockUsdcMint: mintPubkey.toBase58(),
-            agentStipendSol: AGENT_STIPEND_SOL,
-            allowlistedX402Merchant: X402_MERCHANT_PUBKEY.toBase58(),
+            ownerSolUsedForSetupAndStipend: Number(setupSolSpent.toFixed(6)),
             policy: {
               maxPerTxUsdc: "0.50",
               bucketCapUsdc: "1.50",
               windowSecs: 30,
               lifetimeCapUsdc: "5.00",
-              idleTimeoutSecs: 15,
+              idleTimeoutSecs: 120,
             },
           },
           null,
@@ -627,23 +769,26 @@ export default function JudgeSandbox() {
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      appendLog({
-        title: "Setup Demo Vault & Session Failed",
+      appendTrace({
+        title: "Step 1 · Setup Demo Vault & Session Failed",
+        badgeLabel: "SETUP ERROR",
         tone: "trip",
-        detail: msg,
+        deltaSummary: "0.00 USDC",
+        mintSummary: "—",
+        receiptSummary: "—",
+        rawJson: JSON.stringify({ error: msg }, null, 2),
       });
     } finally {
       setBusyAction(null);
     }
   };
 
-  // ACTION 2: Normal x402 Payment (402 -> Pay -> Vault+Receipt Verified -> 200 OK)
-  const handleNormalX402 = async () => {
+  // STEP 2: Normal x402 Payment (402 -> execute_agent_spend -> Vault+Receipt Verified -> 200 OK)
+  const handleStep2NormalPay = async () => {
     if (!agentKeypair || !vaultState || !activeSessionAddress) return;
-    setBusyAction("normal-x402");
+    setBusyAction("step-2");
     try {
       const mintStr = vaultState.mint.toBase58();
-      // Step 1: Request protected resource with sandbox mint -> receive mint-bound HTTP 402 challenge
       const res402 = await fetch(
         `/api/x402/resource?mint=${encodeURIComponent(mintStr)}`,
         {
@@ -656,7 +801,7 @@ export default function JudgeSandbox() {
       if (challenge.mint !== mintStr) {
         throw new Error(
           body402.reason ||
-            `Server strictly enforces EXPECTED_MINT ${challenge.mint}. Set ALLOW_SANDBOX_MOCK_MINT=true for MockUSDC demo.`
+            `Server strictly enforces EXPECTED_MINT ${challenge.mint}.`
         );
       }
 
@@ -669,7 +814,6 @@ export default function JudgeSandbox() {
         true
       );
 
-      // Step 2: Execute bounded spend on Devnet paid by Agent
       const spendTx = new Transaction().add(
         buildExecuteAgentSpendIx({
           agentSigner: agentKeypair.publicKey,
@@ -692,7 +836,6 @@ export default function JudgeSandbox() {
         agentKeypair
       );
 
-      // Step 3: Retry /api/x402/resource with Vault + Mint + Nonce headers
       const res200 = await fetch("/api/x402/resource", {
         cache: "no-store",
         headers: {
@@ -704,6 +847,8 @@ export default function JudgeSandbox() {
       });
       const body200 = await res200.json();
 
+      await refreshOnChainState();
+
       if (res200.status === 200 && body200.verificationProof) {
         setVerifiedMint(body200.verificationProof.mint ?? null);
         setVerifiedMintMode(
@@ -714,38 +859,49 @@ export default function JudgeSandbox() {
           mint: mintStr,
           nonce: challenge.nonce,
           txSig,
+          receiptPda: receiptPda.toBase58(),
         });
+        markStepDone(2);
       }
 
-      await refreshOnChainState();
-
-      appendLog({
-        title: `2. Normal x402 Payment -> HTTP ${res402.status} -> Vault+Receipt Verified -> HTTP ${res200.status}`,
+      appendTrace({
+        title: "Step 2 · Normal x402 Payment Settled & Receipt Verified",
+        badgeLabel: `HTTP ${res200.status} OK`,
         tone: res200.status === 200 ? "ok" : "trip",
+        deltaSummary: "-0.25 MockUSDC (Vault -> Merchant)",
+        mintSummary: `${shortKey(mintStr)} (${body200.verificationProof?.mintVerificationMode ?? "verified"})`,
+        receiptSummary: `${shortKey(receiptPda.toBase58())} Verified`,
         txSig,
-        detail:
-          `--- [1] HTTP ${res402.status} Mint-Bound Challenge ---\n` +
-          `${JSON.stringify(body402.challenge, null, 2)}\n\n` +
-          `--- [2] HTTP ${res200.status} On-Chain Vault + Receipt PDA Verification ---\n` +
-          `${JSON.stringify(body200, null, 2)}`,
+        rawJson: JSON.stringify(
+          {
+            step1_http402Challenge: body402.challenge,
+            step2_http200Verification: body200,
+          },
+          null,
+          2
+        ),
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      appendLog({
-        title: "Normal x402 Payment Error",
+      appendTrace({
+        title: "Step 2 · Normal x402 Payment Error",
+        badgeLabel: "PAYMENT ERROR",
         tone: "trip",
+        deltaSummary: "0.00 USDC",
+        mintSummary: "—",
+        receiptSummary: "—",
         txSig: (err as { txSig?: string })?.txSig,
-        detail: msg,
+        rawJson: JSON.stringify({ error: msg }, null, 2),
       });
     } finally {
       setBusyAction(null);
     }
   };
 
-  // ACTION 2b: Replay Same Receipt (Must Reject 402)
-  const handleReplayReceipt = async () => {
+  // STEP 3: Replay Same Receipt (Single-use HTTP 402 Rejection)
+  const handleStep3Replay = async () => {
     if (!lastRedeemed) return;
-    setBusyAction("replay");
+    setBusyAction("step-3");
     try {
       const replayRes = await fetch("/api/x402/resource", {
         cache: "no-store",
@@ -757,29 +913,40 @@ export default function JudgeSandbox() {
         },
       });
       const replayBody = await replayRes.json();
+      if (replayRes.status === 402) {
+        markStepDone(3);
+      }
 
-      appendLog({
-        title: `2b. Replay Same Receipt -> Rejected with HTTP ${replayRes.status}`,
+      appendTrace({
+        title: "Step 3 · Single-Use Receipt Replay Blocked",
+        badgeLabel: `HTTP ${replayRes.status} REJECTED`,
         tone: replayRes.status === 402 ? "ok" : "trip",
+        deltaSummary: "0.00 USDC (No new tx)",
+        mintSummary: shortKey(lastRedeemed.mint),
+        receiptSummary: `${shortKey(lastRedeemed.receiptPda)} Already Redeemed`,
         txSig: lastRedeemed.txSig,
-        detail: JSON.stringify(replayBody, null, 2),
+        rawJson: JSON.stringify(replayBody, null, 2),
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      appendLog({
-        title: "Replay Verification Error",
+      appendTrace({
+        title: "Step 3 · Replay Test Error",
+        badgeLabel: "ERROR",
         tone: "trip",
-        detail: msg,
+        deltaSummary: "—",
+        mintSummary: "—",
+        receiptSummary: "—",
+        rawJson: JSON.stringify({ error: msg }, null, 2),
       });
     } finally {
       setBusyAction(null);
     }
   };
 
-  // ACTION 3: Inject Drain Attack (Trips Circuit Breaker, 0 Moved)
-  const handleInjectDrain = async () => {
+  // STEP 4: Inject Prompt-Injection Drain (Ok(()) soft-trip, 0 moved, no Receipt PDA, HTTP 402)
+  const handleStep4Drain = async () => {
     if (!agentKeypair || !vaultState || !activeSessionAddress) return;
-    setBusyAction("drain");
+    setBusyAction("step-4");
     try {
       const mintStr = vaultState.mint.toBase58();
       const res402 = await fetch(
@@ -801,7 +968,6 @@ export default function JudgeSandbox() {
 
       const vaultBefore = vaultUsdcBalance;
 
-      // Prompt-injected agent attempts 5.00 USDC drain (10x max_per_tx = 0.50 USDC)
       const drainTx = new Transaction().add(
         buildExecuteAgentSpendIx({
           agentSigner: agentKeypair.publicKey,
@@ -824,7 +990,6 @@ export default function JudgeSandbox() {
         agentKeypair
       );
 
-      // Prove x402 server rejects this non-reverting tx because NO Receipt PDA exists!
       const verifyAttempt = await fetch("/api/x402/resource", {
         cache: "no-store",
         headers: {
@@ -836,36 +1001,49 @@ export default function JudgeSandbox() {
       });
       const verifyBody = await verifyAttempt.json();
       await refreshOnChainState();
+      markStepDone(4);
 
-      appendLog({
+      appendTrace({
         title:
-          "3. Prompt-Injection Drain Blocked -> Session Permanently TRIPPED (0 Tokens Moved)",
+          "Step 4 · Prompt-Injection Drain Soft-Tripped Circuit Breaker (0 Moved)",
+        badgeLabel: `TRIPPED · HTTP ${verifyAttempt.status}`,
         tone: "trip",
+        deltaSummary: `0.00 MockUSDC moved (Vault held ${formatUsdc(vaultBefore)})`,
+        mintSummary: shortKey(mintStr),
+        receiptSummary: "NONE (Unallocated on trip)",
         txSig,
-        detail:
-          `Attempted Drain: ${formatUsdc(X402_DRAIN_AMOUNT)} MockUSDC (> max_per_tx 0.50)\n` +
-          `Vault Balance Before: ${formatUsdc(vaultBefore)} MockUSDC -> Moved: 0.00 MockUSDC\n` +
-          `On-Chain Tx Status: Ok(()) committed SessionStatus::Tripped (ExceedsPerTxMax), Receipt PDA NOT allocated.\n\n` +
-          `--- /api/x402/resource Spoof Check (HTTP ${verifyAttempt.status}) ---\n` +
-          `${JSON.stringify(verifyBody, null, 2)}`,
+        rawJson: JSON.stringify(
+          {
+            attemptedDrainUsdc: formatUsdc(X402_DRAIN_AMOUNT),
+            onChainOutcome:
+              "Ok(()) committed SessionStatus::Tripped (ExceedsPerTxMax), 0 tokens transferred, 0 Receipt allocated",
+            x402VerifierResponse: verifyBody,
+          },
+          null,
+          2
+        ),
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      appendLog({
-        title: "Drain Attack Simulation Error",
+      appendTrace({
+        title: "Step 4 · Drain Simulation Error",
+        badgeLabel: "ERROR",
         tone: "trip",
+        deltaSummary: "0.00 USDC",
+        mintSummary: "—",
+        receiptSummary: "—",
         txSig: (err as { txSig?: string })?.txSig,
-        detail: msg,
+        rawJson: JSON.stringify({ error: msg }, null, 2),
       });
     } finally {
       setBusyAction(null);
     }
   };
 
-  // ACTION 4: Salami Retry After Trip (Hard Reverts)
-  const handleSalamiRetry = async () => {
+  // STEP 5: Salami Retry After Trip (Hard-reverts Custom(6010) / SessionNotActive)
+  const handleStep5Salami = async () => {
     if (!agentKeypair || !vaultState || !activeSessionAddress) return;
-    setBusyAction("salami");
+    setBusyAction("step-5");
     try {
       const mintStr = vaultState.mint.toBase58();
       const res402 = await fetch(
@@ -894,7 +1072,7 @@ export default function JudgeSandbox() {
           merchant: X402_MERCHANT_PUBKEY,
           merchantAta,
           receipt: receiptPda,
-          amount: X402_SALAMI_AMOUNT, // Tiny 0.0001 USDC retry
+          amount: X402_SALAMI_AMOUNT,
           requestHash: requestHashBytes,
           receiptTtlSlots: X402_RECEIPT_TTL_SLOTS,
         })
@@ -908,35 +1086,54 @@ export default function JudgeSandbox() {
         true
       );
 
-      appendLog({
-        title: "Unexpected: Salami Retry Did Not Revert",
+      appendTrace({
+        title: "Step 5 · Unexpected: Session Was Still Active",
+        badgeLabel: "WARN",
         tone: "warn",
-        detail: "Session was still Active; trip the circuit breaker in Step 3 first.",
+        deltaSummary: "-0.0001 USDC",
+        mintSummary: shortKey(mintStr),
+        receiptSummary: "—",
+        rawJson: JSON.stringify(
+          { warning: "Run Step 4 first to trip the Session." },
+          null,
+          2
+        ),
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       const txSig = (err as { txSig?: string })?.txSig;
       await refreshOnChainState();
-      appendLog({
+      markStepDone(5);
+      appendTrace({
         title:
-          "4. Salami Retry Hard-Reverted On-Chain (VaultError::SessionNotActive / 0x177a)",
+          "Step 5 · Salami Retry Hard-Reverted On-Chain (Custom(6010) / SessionNotActive)",
+        badgeLabel: "REVERTED 0x177a",
         tone: "ok",
+        deltaSummary: "0.00 MockUSDC moved (Hard Revert)",
+        mintSummary: vaultState ? shortKey(vaultState.mint.toBase58()) : "—",
+        receiptSummary: "Blocked at terminal status gate",
         txSig,
-        detail:
-          `Attempted Salami Spend: ${formatUsdc(X402_SALAMI_AMOUNT)} MockUSDC (100 base units)\n` +
-          `Terminal Gate Enforcement: Zero recovery path once SessionStatus != Active.\n` +
-          `Raw Revert Error: ${msg}`,
+        rawJson: JSON.stringify(
+          {
+            attemptedSalamiAmountBaseUnits: X402_SALAMI_AMOUNT.toString(),
+            terminalInvariant:
+              "Zero recovery path once SessionStatus != Active",
+            onChainError: msg,
+          },
+          null,
+          2
+        ),
       });
     } finally {
       setBusyAction(null);
     }
   };
 
-  // ACTION 5: Permissionless Reap Idle / Tripped Session
-  const handleReapSession = async () => {
+  // STEP 6: Permissionless Reap Idle / Tripped Session
+  const handleStep6Reap = async () => {
     if (!agentKeypair || !ownerKeypair || !vaultState || !activeSessionAddress)
       return;
-    setBusyAction("reap");
+    setBusyAction("step-6");
     try {
       const ownerLamportsBefore = await connection.getBalance(
         ownerKeypair.publicKey,
@@ -966,22 +1163,38 @@ export default function JudgeSandbox() {
         (ownerLamportsAfter - ownerLamportsBefore) / LAMPORTS_PER_SOL;
 
       await refreshOnChainState();
-      appendLog({
-        title: `5. Permissionless Reap Succeeded (+${reclaimedSol.toFixed(6)} SOL Rent Returned to Owner)`,
+      markStepDone(6);
+      appendTrace({
+        title:
+          "Step 6 · Permissionless Reap Closed Session & Returned Rent to Owner",
+        badgeLabel: `+${reclaimedSol.toFixed(5)} SOL`,
         tone: "ok",
+        deltaSummary: `+${reclaimedSol.toFixed(6)} SOL to Vault Owner`,
+        mintSummary: shortKey(vaultState.mint.toBase58()),
+        receiptSummary: `Session ${shortKey(activeSessionAddress.toBase58())} Closed`,
         txSig,
-        detail:
-          `Closed Session PDA: ${activeSessionAddress.toBase58()}\n` +
-          `Permissionless Caller: ${agentKeypair.publicKey.toBase58()} (non-owner)\n` +
-          `Enforced Rent Recipient: ${ownerKeypair.publicKey.toBase58()} (vault.owner)`,
+        rawJson: JSON.stringify(
+          {
+            closedSessionPda: activeSessionAddress.toBase58(),
+            permissionlessCaller: agentKeypair.publicKey.toBase58(),
+            enforcedRentRecipient: ownerKeypair.publicKey.toBase58(),
+            reclaimedSol: Number(reclaimedSol.toFixed(6)),
+          },
+          null,
+          2
+        ),
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      appendLog({
-        title: "Permissionless Reap Rejected (Session Still Active & Non-Idle)",
+      appendTrace({
+        title: "Step 6 · Permissionless Reap Rejected (Session Still Active)",
+        badgeLabel: "STILL ACTIVE",
         tone: "warn",
+        deltaSummary: "0.00 SOL",
+        mintSummary: "—",
+        receiptSummary: "Trip in Step 4 or wait past idle timeout",
         txSig: (err as { txSig?: string })?.txSig,
-        detail: `Session must be Tripped/Revoked OR idle > 15s before permissionless reap.\nRaw Error: ${msg}`,
+        rawJson: JSON.stringify({ error: msg }, null, 2),
       });
     } finally {
       setBusyAction(null);
@@ -989,7 +1202,7 @@ export default function JudgeSandbox() {
   };
 
   const availableBucket = useMemo(() => {
-    if (!sessionState) return 0n;
+    if (!sessionState || nowSec === 0n) return sessionState?.bucketTokens ?? 0n;
     return computeAvailableBucketTokens(sessionState, nowSec);
   }, [sessionState, nowSec]);
 
@@ -1010,38 +1223,49 @@ export default function JudgeSandbox() {
   }, [sessionState]);
 
   const idleSecondsElapsed = useMemo(() => {
-    if (!sessionState) return 0n;
+    if (!sessionState || nowSec === 0n) return 0n;
     const diff = nowSec - sessionState.lastActiveTs;
     return diff > 0n ? diff : 0n;
   }, [sessionState, nowSec]);
 
-  const hasReadySession = Boolean(vaultState && activeSessionAddress);
+  const recommendedStep = useMemo(() => {
+    if (!vaultState || !activeSessionAddress || sessionReaped) return 1;
+    if (!completedSteps[2] && sessionState?.status === "Active") return 2;
+    if (lastRedeemed && !completedSteps[3]) return 3;
+    if (sessionState?.status === "Active") return 4;
+    if (sessionState?.status === "Tripped" && !completedSteps[5]) return 5;
+    if (sessionState && !sessionReaped) return 6;
+    return 1;
+  }, [
+    vaultState,
+    activeSessionAddress,
+    sessionReaped,
+    completedSteps,
+    sessionState,
+    lastRedeemed,
+  ]);
+
+  const hasLiveSession = Boolean(
+    vaultState && activeSessionAddress && !sessionReaped
+  );
 
   return (
-    <main className="sandbox-shell">
-      <header className="topbar">
-        <div className="topbar-title-group">
-          <h1>Leash Judge Sandbox</h1>
-          <p className="topbar-subtitle">
-            Non-custodial payer-side spending control plane &amp; prompt-injection
-            circuit breaker for Solana <code>x402</code> autonomous agents.
-          </p>
-        </div>
+    <main className="console-shell">
+      <header className="hero-header">
+        <div className="hero-top-row">
+          <div className="brand-heading">
+            <h1>Leash — Solana x402 Circuit Breaker</h1>
+            <p className="brand-pitch">
+              <strong>Non-custodial AI agent spending control plane:</strong>{" "}
+              policy violations commit an irreversible on-chain{" "}
+              <code>SessionStatus::Tripped</code> state with{" "}
+              <strong>0 tokens moved</strong>, while canonical{" "}
+              <code>Receipt</code> PDAs + <code>Vault.mint</code> binding close
+              the non-reverting HTTP <code>402</code> verification trap.
+            </p>
+          </div>
 
-        <div className="topbar-meta">
-          <span className="meta-chip mono">
-            Program:{" "}
-            <a
-              href={explorerAddressUrl(LEASH_PROGRAM_ID.toBase58())}
-              target="_blank"
-              rel="noreferrer"
-            >
-              {LEASH_PROGRAM_ID.toBase58().slice(0, 8)}...
-              {LEASH_PROGRAM_ID.toBase58().slice(-6)}
-            </a>
-          </span>
-
-          <div className="rpc-input-wrap">
+          <div className="rpc-box">
             <label htmlFor="rpc-endpoint-input">Devnet RPC</label>
             <input
               id="rpc-endpoint-input"
@@ -1053,26 +1277,98 @@ export default function JudgeSandbox() {
             />
           </div>
         </div>
+
+        <div className="status-strip" aria-label="Live System Diagnostics">
+          <span className="status-pill mono" id="pill-program-id">
+            <span className="dot dot-ok" />
+            Program:{" "}
+            <a
+              href={explorerAddressUrl(LEASH_PROGRAM_ID.toBase58())}
+              target="_blank"
+              rel="noreferrer"
+            >
+              {shortKey(LEASH_PROGRAM_ID.toBase58())} ↗
+            </a>
+          </span>
+
+          <span className="status-pill mono" id="pill-devnet-rpc">
+            <span className="dot dot-ok" />
+            Devnet Live (
+            {serverStatus?.rpcMode === "custom_rpc"
+              ? "Custom RPC"
+              : "Public RPC"}
+            )
+          </span>
+
+          <span className="status-pill mono" id="pill-faucet-status">
+            <span
+              className={`dot ${
+                serverStatus?.faucet.configured ? "dot-ok" : "dot-warn"
+              }`}
+            />
+            {serverStatus?.faucet.configured
+              ? `Faucet Ready${
+                  serverStatus.faucet.balanceSol !== undefined
+                    ? ` · ${serverStatus.faucet.balanceSol.toFixed(2)} SOL`
+                    : ""
+                }`
+              : "Manual Faucet"}
+          </span>
+
+          <span className="status-pill mono" id="pill-replay-store">
+            <span className="dot dot-cyan" />
+            Replay:{" "}
+            {serverStatus?.replayStore === "upstash_redis"
+              ? "Upstash Atomic"
+              : "In-Memory"}
+          </span>
+
+          <span className="status-pill mono" id="pill-mint-policy">
+            <span
+              className={`dot ${
+                serverStatus?.mintPolicy.mode === "strict_usdc"
+                  ? "dot-ok"
+                  : "dot-warn"
+              }`}
+            />
+            {serverStatus?.mintPolicy.mode === "strict_usdc"
+              ? "Strict Devnet USDC"
+              : "Sandbox MockUSDC"}
+          </span>
+        </div>
+
+        <div className="mock-disclosure">
+          <strong>Mint Policy Disclosure:</strong> This Judge Sandbox mints
+          disposable 6-decimal <code>MockUSDC</code> per browser Vault so judges
+          can run adversarial drains instantly without external token faucets.
+          Production deployments set{" "}
+          <code>ALLOW_SANDBOX_MOCK_MINT=false</code> to strictly enforce
+          canonical USDC (
+          <code>{DEVNET_USDC_MINT.toBase58().slice(0, 8)}...</code>) on{" "}
+          <code>Vault.mint</code>.
+        </div>
       </header>
 
-      <section className="wallets-strip" aria-label="Ephemeral Browser Devnet Wallets">
-        <article className="panel">
-          <div className="wallet-card-head">
-            <span className="wallet-role">Browser Vault Owner (localStorage)</span>
-            <span className="wallet-balance mono">{ownerSol.toFixed(4)} SOL</span>
+      <section className="wallets-bar" aria-label="Ephemeral Browser Keypairs">
+        <article className="card">
+          <div className="wallet-top">
+            <span className="wallet-label">
+              Browser Vault Owner (localStorage)
+            </span>
+            <span className="wallet-sol mono">{ownerSol.toFixed(4)} SOL</span>
           </div>
-          <div className="wallet-pubkey mono">
-            {ownerKeypair ? ownerKeypair.publicKey.toBase58() : "Generating..."}
+          <div className="wallet-addr mono">
+            {ownerKeypair ? ownerKeypair.publicKey.toBase58() : "Initializing..."}
           </div>
-          <div className="wallet-actions">
+          <div className="wallet-btn-row">
             <button
-              id="btn-airdrop-owner"
+              id="btn-fund-owner"
               type="button"
-              className="btn btn-primary"
+              className="btn btn-accent"
               disabled={!ownerKeypair || busyAction !== null}
-              onClick={() => handleAirdrop("owner")}
+              onClick={() => handleManualFund("owner")}
             >
-              {busyAction === "airdrop-owner" ? "Funding..." : "Fund Owner SOL"}
+              {busyAction === "fund-owner" ? "Funding..." : "Drip 0.05 SOL"}
             </button>
             <button
               id="btn-copy-owner"
@@ -1096,39 +1392,27 @@ export default function JudgeSandbox() {
               faucet.solana.com ↗
             </a>
           </div>
-          {faucetThrottled && (
-            <div className="faucet-note">
-              Server faucet unconfigured or public RPC throttled. Copy the Owner
-              pubkey above and request Devnet SOL at{" "}
-              <a
-                href="https://faucet.solana.com"
-                target="_blank"
-                rel="noreferrer"
-              >
-                faucet.solana.com
-              </a>
-              . Step 1 fits cleanly under 0.04 SOL (including Agent stipend).
-            </div>
-          )}
         </article>
 
-        <article className="panel">
-          <div className="wallet-card-head">
-            <span className="wallet-role">Browser Agent Signer (localStorage)</span>
-            <span className="wallet-balance mono">{agentSol.toFixed(4)} SOL</span>
+        <article className="card">
+          <div className="wallet-top">
+            <span className="wallet-label">
+              Browser Agent Signer (Pays Tx + Receipt Rent)
+            </span>
+            <span className="wallet-sol mono">{agentSol.toFixed(4)} SOL</span>
           </div>
-          <div className="wallet-pubkey mono">
-            {agentKeypair ? agentKeypair.publicKey.toBase58() : "Generating..."}
+          <div className="wallet-addr mono">
+            {agentKeypair ? agentKeypair.publicKey.toBase58() : "Initializing..."}
           </div>
-          <div className="wallet-actions">
+          <div className="wallet-btn-row">
             <button
-              id="btn-airdrop-agent"
+              id="btn-fund-agent"
               type="button"
               className="btn"
               disabled={!agentKeypair || busyAction !== null}
-              onClick={() => handleAirdrop("agent")}
+              onClick={() => handleManualFund("agent")}
             >
-              {busyAction === "airdrop-agent" ? "Funding..." : "Fund Agent SOL"}
+              {busyAction === "fund-agent" ? "Funding..." : "Drip Agent SOL"}
             </button>
             <button
               id="btn-copy-agent"
@@ -1141,6 +1425,32 @@ export default function JudgeSandbox() {
               }
             >
               {copiedLabel === "agent" ? "Copied!" : "Copy Pubkey"}
+            </button>
+          </div>
+        </article>
+
+        <article className="card session-controls-card">
+          <div>
+            <div className="wallet-label">Sandbox Controls</div>
+            <div
+              style={{
+                fontSize: "0.77rem",
+                color: "var(--ink-secondary)",
+                marginTop: "4px",
+              }}
+            >
+              Re-open a clean Session or rotate browser wallets anytime.
+            </div>
+          </div>
+          <div className="wallet-btn-row">
+            <button
+              id="btn-reset-session"
+              type="button"
+              className="btn"
+              disabled={busyAction !== null}
+              onClick={handleResetSession}
+            >
+              Reset / New Session
             </button>
             <button
               id="btn-rotate-keys"
@@ -1155,168 +1465,348 @@ export default function JudgeSandbox() {
         </article>
       </section>
 
-      <div className="workbench-grid">
-        <div className="left-stack">
-          <section className="panel" aria-labelledby="actions-heading">
-            <div className="section-heading">
-              <h2 id="actions-heading">Devnet Verification Actions</h2>
+      {faucetThrottled && (
+        <div className="faucet-fallback-banner">
+          Public Devnet RPC throttled airdrop. Click{" "}
+          <strong>Copy Pubkey</strong> on Browser Vault Owner above and request
+          SOL at{" "}
+          <a
+            href="https://faucet.solana.com"
+            target="_blank"
+            rel="noreferrer"
+          >
+            faucet.solana.com
+          </a>
+          . Step 1 fits cleanly under <code>0.04 SOL</code> including the Agent
+          stipend.
+        </div>
+      )}
+
+      <div className="mission-grid">
+        <div className="left-column">
+          <section className="card" aria-labelledby="mission-heading">
+            <div className="card-header">
+              <h2 id="mission-heading">Guided 6-Step Adversarial Verification</h2>
               <button
                 id="btn-refresh-state"
                 type="button"
                 className="btn"
-                onClick={() => void refreshOnChainState()}
+                onClick={() => {
+                  void refreshOnChainState();
+                  void fetchServerStatus();
+                }}
               >
                 Refresh
               </button>
             </div>
 
-            <div className="action-list">
+            <div className="steps-stack">
               <button
-                id="btn-setup-demo"
+                id="btn-step-1-setup"
                 type="button"
-                className="action-button"
+                className={`step-btn ${
+                  recommendedStep === 1 ? "step-btn-next" : ""
+                }`}
                 disabled={!ownerKeypair || busyAction !== null}
-                onClick={handleSetupDemo}
+                onClick={handleStep1Setup}
               >
-                <span className="action-title">
-                  <span>1. Setup Demo Vault &amp; Session</span>
-                  <span className="mono">
-                    {busyAction === "setup" ? "Running..." : "< 0.04 SOL"}
-                  </span>
+                <span
+                  className={`step-num mono ${
+                    completedSteps[1] ? "step-num-done" : ""
+                  }`}
+                >
+                  {completedSteps[1] ? "✓" : "1"}
                 </span>
-                <span className="action-desc">
-                  Auto-funds via /api/faucet (with fallback), creates MockUSDC
-                  mint, funds Vault (10 USDC), and opens bounded Session.
+                <span className="step-content">
+                  <span className="step-title-row">
+                    <span>Setup Demo Vault &amp; Session</span>
+                    <span
+                      className={`step-tag mono ${
+                        recommendedStep === 1
+                          ? "step-tag-next"
+                          : completedSteps[1]
+                          ? "step-tag-done"
+                          : "step-tag-idle"
+                      }`}
+                    >
+                      {busyAction === "step-1"
+                        ? "RUNNING..."
+                        : recommendedStep === 1
+                        ? "NEXT"
+                        : completedSteps[1]
+                        ? "DONE"
+                        : "< 0.04 SOL"}
+                    </span>
+                  </span>
+                  <span className="step-desc">
+                    Auto-drips 0.05 SOL via /api/faucet, mints 10 MockUSDC to
+                    Vault PDA, and opens bounded Session (0.50 max/tx).
+                  </span>
                 </span>
               </button>
 
               <button
-                id="btn-normal-x402"
+                id="btn-step-2-pay"
                 type="button"
-                className="action-button"
-                disabled={!hasReadySession || busyAction !== null}
-                onClick={handleNormalX402}
+                className={`step-btn ${
+                  recommendedStep === 2 ? "step-btn-next" : ""
+                }`}
+                disabled={!hasLiveSession || busyAction !== null}
+                onClick={handleStep2NormalPay}
               >
-                <span className="action-title">
-                  <span>
-                    2. Normal x402 Payment (402 -&gt; Pay -&gt; Receipt Verified
-                    -&gt; 200 OK)
-                  </span>
-                  <span className="mono">
-                    {busyAction === "normal-x402" ? "Verifying..." : "0.25 USDC"}
-                  </span>
+                <span
+                  className={`step-num mono ${
+                    completedSteps[2] ? "step-num-done" : ""
+                  }`}
+                >
+                  {completedSteps[2] ? "✓" : "2"}
                 </span>
-                <span className="action-desc">
-                  Fetches mint-bound HTTP 402 challenge, settles 0.25 USDC, and
-                  verifies both Vault.mint and Receipt PDA on Devnet.
+                <span className="step-content">
+                  <span className="step-title-row">
+                    <span>Normal x402 Payment (402 -&gt; 200 OK)</span>
+                    <span
+                      className={`step-tag mono ${
+                        recommendedStep === 2
+                          ? "step-tag-next"
+                          : completedSteps[2]
+                          ? "step-tag-done"
+                          : "step-tag-idle"
+                      }`}
+                    >
+                      {busyAction === "step-2"
+                        ? "SETTLING..."
+                        : recommendedStep === 2
+                        ? "NEXT"
+                        : completedSteps[2]
+                        ? "DONE"
+                        : "0.25 USDC"}
+                    </span>
+                  </span>
+                  <span className="step-desc">
+                    Settles 0.25 USDC via execute_agent_spend; server verifies
+                    Receipt PDA + Vault.mint before returning 200 OK.
+                  </span>
                 </span>
               </button>
 
               <button
-                id="btn-replay-receipt"
+                id="btn-step-3-replay"
                 type="button"
-                className="action-button"
+                className={`step-btn ${
+                  recommendedStep === 3 ? "step-btn-next" : ""
+                }`}
                 disabled={!lastRedeemed || busyAction !== null}
-                onClick={handleReplayReceipt}
+                onClick={handleStep3Replay}
               >
-                <span className="action-title">
-                  <span>2b. Replay Same Receipt (Must Reject 402)</span>
-                  <span className="mono">
-                    {busyAction === "replay" ? "Testing..." : "Single-Use"}
-                  </span>
+                <span
+                  className={`step-num mono ${
+                    completedSteps[3] ? "step-num-done" : ""
+                  }`}
+                >
+                  {completedSteps[3] ? "✓" : "3"}
                 </span>
-                <span className="action-desc">
-                  Re-submits the exact headers from the last redeemed 200 OK
-                  Receipt to verify single-use HTTP 402 replay rejection.
+                <span className="step-content">
+                  <span className="step-title-row">
+                    <span>Replay Same Receipt (Single-Use Guard)</span>
+                    <span
+                      className={`step-tag mono ${
+                        recommendedStep === 3
+                          ? "step-tag-next"
+                          : completedSteps[3]
+                          ? "step-tag-done"
+                          : "step-tag-idle"
+                      }`}
+                    >
+                      {busyAction === "step-3"
+                        ? "CHECKING..."
+                        : recommendedStep === 3
+                        ? "NEXT"
+                        : completedSteps[3]
+                        ? "DONE"
+                        : "MUST 402"}
+                    </span>
+                  </span>
+                  <span className="step-desc">
+                    Re-sends the redeemed Receipt headers; atomic SET NX EX
+                    replay lock rejects reuse with HTTP 402.
+                  </span>
                 </span>
               </button>
 
               <button
-                id="btn-inject-drain"
+                id="btn-step-4-drain"
                 type="button"
-                className="action-button action-button-danger"
-                disabled={!hasReadySession || busyAction !== null}
-                onClick={handleInjectDrain}
+                className={`step-btn step-btn-danger ${
+                  recommendedStep === 4 ? "step-btn-next" : ""
+                }`}
+                disabled={!hasLiveSession || busyAction !== null}
+                onClick={handleStep4Drain}
               >
-                <span className="action-title">
-                  <span>
-                    3. Inject Drain Attack (Trips Circuit Breaker, 0 Moved)
-                  </span>
-                  <span className="mono">
-                    {busyAction === "drain" ? "Tripping..." : "5.00 USDC"}
-                  </span>
+                <span
+                  className={`step-num mono ${
+                    completedSteps[4] ? "step-num-done" : ""
+                  }`}
+                >
+                  {completedSteps[4] ? "✓" : "4"}
                 </span>
-                <span className="action-desc">
-                  Attempts 5.00 USDC spend (&gt; 0.50 max_per_tx). Commits
-                  Tripped state on-chain, moves 0 tokens, allocates no Receipt.
+                <span className="step-content">
+                  <span className="step-title-row">
+                    <span>Inject Prompt-Injection Drain (Soft-Trip)</span>
+                    <span
+                      className={`step-tag mono ${
+                        recommendedStep === 4
+                          ? "step-tag-next"
+                          : completedSteps[4]
+                          ? "step-tag-done"
+                          : "step-tag-idle"
+                      }`}
+                    >
+                      {busyAction === "step-4"
+                        ? "TRIPPING..."
+                        : recommendedStep === 4
+                        ? "NEXT"
+                        : completedSteps[4]
+                        ? "DONE"
+                        : "5.00 USDC"}
+                    </span>
+                  </span>
+                  <span className="step-desc">
+                    Attempts 5.00 USDC (&gt; max_per_tx). Commits Tripped via
+                    Ok(()), moves 0 tokens, allocates no Receipt, rejected 402.
+                  </span>
                 </span>
               </button>
 
               <button
-                id="btn-salami-retry"
+                id="btn-step-5-salami"
                 type="button"
-                className="action-button"
-                disabled={!hasReadySession || busyAction !== null}
-                onClick={handleSalamiRetry}
+                className={`step-btn ${
+                  recommendedStep === 5 ? "step-btn-next" : ""
+                }`}
+                disabled={!hasLiveSession || busyAction !== null}
+                onClick={handleStep5Salami}
               >
-                <span className="action-title">
-                  <span>4. Salami Retry After Trip (Hard Reverts)</span>
-                  <span className="mono">
-                    {busyAction === "salami" ? "Testing..." : "0.0001 USDC"}
-                  </span>
+                <span
+                  className={`step-num mono ${
+                    completedSteps[5] ? "step-num-done" : ""
+                  }`}
+                >
+                  {completedSteps[5] ? "✓" : "5"}
                 </span>
-                <span className="action-desc">
-                  Attempts tiny 100-unit follow-up spend on tripped Session.
-                  Hard-reverts on-chain with SessionNotActive (zero recovery).
+                <span className="step-content">
+                  <span className="step-title-row">
+                    <span>Salami Retry After Trip (Hard-Reverts)</span>
+                    <span
+                      className={`step-tag mono ${
+                        recommendedStep === 5
+                          ? "step-tag-next"
+                          : completedSteps[5]
+                          ? "step-tag-done"
+                          : "step-tag-idle"
+                      }`}
+                    >
+                      {busyAction === "step-5"
+                        ? "TESTING..."
+                        : recommendedStep === 5
+                        ? "NEXT"
+                        : completedSteps[5]
+                        ? "DONE"
+                        : "0.0001 USDC"}
+                    </span>
+                  </span>
+                  <span className="step-desc">
+                    Attempts tiny 100-unit follow-up spend on Tripped Session;
+                    hard-reverts on-chain with Custom(6010) / SessionNotActive.
+                  </span>
                 </span>
               </button>
 
               <button
-                id="btn-reap-session"
+                id="btn-step-6-reap"
                 type="button"
-                className="action-button"
-                disabled={!hasReadySession || busyAction !== null}
-                onClick={handleReapSession}
+                className={`step-btn ${
+                  recommendedStep === 6 ? "step-btn-next" : ""
+                }`}
+                disabled={!hasLiveSession || busyAction !== null}
+                onClick={handleStep6Reap}
               >
-                <span className="action-title">
-                  <span>5. Permissionless Reap Idle Session</span>
-                  <span className="mono">
-                    {busyAction === "reap" ? "Reaping..." : "Reclaim Rent"}
-                  </span>
+                <span
+                  className={`step-num mono ${
+                    completedSteps[6] ? "step-num-done" : ""
+                  }`}
+                >
+                  {completedSteps[6] ? "✓" : "6"}
                 </span>
-                <span className="action-desc">
-                  Non-owner caller closes Tripped or idle (&gt;15s) Session PDA
-                  and returns 100% of rent lamports directly to Vault Owner.
+                <span className="step-content">
+                  <span className="step-title-row">
+                    <span>Permissionless Reap Idle / Tripped Session</span>
+                    <span
+                      className={`step-tag mono ${
+                        recommendedStep === 6
+                          ? "step-tag-next"
+                          : completedSteps[6]
+                          ? "step-tag-done"
+                          : "step-tag-idle"
+                      }`}
+                    >
+                      {busyAction === "step-6"
+                        ? "REAPING..."
+                        : recommendedStep === 6
+                        ? "NEXT"
+                        : completedSteps[6]
+                        ? "DONE"
+                        : "RECLAIM SOL"}
+                    </span>
+                  </span>
+                  <span className="step-desc">
+                    Non-owner caller closes Tripped Session PDA and returns 100%
+                    of rent lamports directly to vault.owner.
+                  </span>
                 </span>
               </button>
             </div>
           </section>
+        </div>
 
-          <section className="panel" aria-labelledby="telemetry-heading">
-            <div className="section-heading">
+        <div className="right-column">
+          <section className="card" aria-labelledby="telemetry-heading">
+            <div className="card-header">
               <h2 id="telemetry-heading">Live On-Chain Vault &amp; Session State</h2>
               {sessionState ? (
                 <span
-                  className={`badge ${
+                  id="session-status-badge"
+                  className={`status-badge mono ${
                     sessionState.status === "Active"
                       ? "badge-active"
                       : "badge-tripped"
                   }`}
                 >
-                  {sessionState.status}
+                  {sessionState.status === "Tripped"
+                    ? `TRIPPED · ${sessionState.tripReason}`
+                    : sessionState.status.toUpperCase()}
                 </span>
               ) : sessionReaped ? (
-                <span className="badge badge-neutral">Reaped (Closed)</span>
+                <span
+                  id="session-status-badge"
+                  className="status-badge mono badge-neutral"
+                >
+                  REAPED (RENT RETURNED)
+                </span>
               ) : (
-                <span className="badge badge-neutral">Uninitialized</span>
+                <span
+                  id="session-status-badge"
+                  className="status-badge mono badge-neutral"
+                >
+                  UNINITIALIZED
+                </span>
               )}
             </div>
 
             {sessionState && (
-              <>
-                <div className="meter-block">
-                  <div className="meter-labels">
-                    <span>Leaky-Bucket Available (30s linear refill)</span>
+              <div className="meters-wrap">
+                <div>
+                  <div className="meter-head">
+                    <span>Leaky-Bucket Rate Limit (30s linear refill)</span>
                     <span className="mono">
                       {formatUsdc(availableBucket)} /{" "}
                       {formatUsdc(sessionState.bucketCap)} USDC
@@ -1324,9 +1814,9 @@ export default function JudgeSandbox() {
                   </div>
                   <div className="meter-track">
                     <div
-                      className={`meter-fill ${
+                      className={`meter-bar ${
                         sessionState.status !== "Active"
-                          ? "meter-fill-tripped"
+                          ? "meter-bar-tripped"
                           : ""
                       }`}
                       style={{ width: `${bucketPct}%` }}
@@ -1334,9 +1824,9 @@ export default function JudgeSandbox() {
                   </div>
                 </div>
 
-                <div className="meter-block">
-                  <div className="meter-labels">
-                    <span>Lifetime Session Spend</span>
+                <div>
+                  <div className="meter-head">
+                    <span>Lifetime Session Cap</span>
                     <span className="mono">
                       {formatUsdc(sessionState.lifetimeSpent)} /{" "}
                       {formatUsdc(sessionState.lifetimeCap)} USDC
@@ -1344,159 +1834,466 @@ export default function JudgeSandbox() {
                   </div>
                   <div className="meter-track">
                     <div
-                      className="meter-fill"
+                      className="meter-bar"
                       style={{ width: `${lifetimePct}%` }}
                     />
                   </div>
                 </div>
-              </>
+              </div>
             )}
 
-            <div className="kv-table">
-              <div className="kv-key">Vault Balance</div>
-              <div className="kv-val mono">
+            <div className="state-grid">
+              <div className="state-k">Vault Balance</div>
+              <div className="state-v mono" id="val-vault-balance">
                 {vaultState ? `${formatUsdc(vaultUsdcBalance)} MockUSDC` : "—"}
               </div>
 
-              <div className="kv-key">Vault Mint</div>
-              <div className="kv-val mono">
-                {vaultState
-                  ? vaultState.mint.toBase58()
-                  : `Default Expected: ${DEVNET_USDC_MINT.toBase58()}`}
-              </div>
-
-              <div className="kv-key">Verified Mint</div>
-              <div className="kv-val mono">
-                {verifiedMint
-                  ? `${verifiedMint} (${verifiedMintMode ?? "verified"})`
-                  : "—"}
-              </div>
-
-              <div className="kv-key">Vault Paused</div>
-              <div className="kv-val mono">
-                {vaultState ? String(vaultState.paused) : "—"}
-              </div>
-
-              <div className="kv-key">Trip Reason</div>
-              <div className="kv-val mono">
+              <div className="state-k">Trip Reason</div>
+              <div className="state-v mono" id="val-trip-reason">
                 {sessionState ? sessionState.tripReason : "—"}
               </div>
 
-              <div className="kv-key">Max Per Tx</div>
-              <div className="kv-val mono">
+              <div className="state-k">Max Per Tx</div>
+              <div className="state-v mono">
                 {sessionState
                   ? `${formatUsdc(sessionState.maxPerTx)} USDC`
                   : "—"}
               </div>
 
-              <div className="kv-key">Idle Timer</div>
-              <div className="kv-val mono">
+              <div className="state-k">Idle Window</div>
+              <div className="state-v mono">
                 {sessionState
                   ? `${idleSecondsElapsed.toString()}s / ${sessionState.idleTimeoutSecs.toString()}s`
                   : "—"}
               </div>
 
-              <div className="kv-key">Vault PDA</div>
-              <div className="kv-val mono">
+              <div className="state-k">Verified Mint</div>
+              <div className="state-v mono">
+                {verifiedMint
+                  ? `${shortKey(verifiedMint)} (${verifiedMintMode})`
+                  : vaultState
+                  ? `${shortKey(vaultState.mint.toBase58())} (Vault.mint)`
+                  : "—"}
+              </div>
+
+              <div className="state-k">Vault PDA</div>
+              <div className="state-v mono">
                 {vaultState ? (
                   <a
                     href={explorerAddressUrl(vaultState.address.toBase58())}
                     target="_blank"
                     rel="noreferrer"
                   >
-                    {vaultState.address.toBase58()}
+                    {shortKey(vaultState.address.toBase58())} ↗
                   </a>
                 ) : (
                   "—"
                 )}
               </div>
 
-              <div className="kv-key">Session PDA</div>
-              <div className="kv-val mono">
+              <div className="state-k">Session PDA</div>
+              <div className="state-v mono">
                 {activeSessionAddress ? (
                   <a
                     href={explorerAddressUrl(activeSessionAddress.toBase58())}
                     target="_blank"
                     rel="noreferrer"
                   >
-                    {activeSessionAddress.toBase58()}
+                    {shortKey(activeSessionAddress.toBase58())} ↗
                   </a>
                 ) : (
                   "—"
                 )}
               </div>
 
-              <div className="kv-key">Allowlist ({vaultState?.allowlist.length ?? 0}/16)</div>
-              <div className="kv-val mono">
-                {vaultState && vaultState.allowlist.length > 0
-                  ? vaultState.allowlist.map((pk) => pk.toBase58()).join(", ")
-                  : `Default x402: ${X402_MERCHANT_PUBKEY.toBase58()}`}
+              <div className="state-k">
+                Allowlist ({vaultState?.allowlist.length ?? 0}/16)
+              </div>
+              <div className="state-v">
+                <div className="allowlist-pills">
+                  {vaultState && vaultState.allowlist.length > 0 ? (
+                    vaultState.allowlist.map((pk) => (
+                      <span
+                        key={pk.toBase58()}
+                        className="allowlist-pill mono"
+                      >
+                        {shortKey(pk.toBase58())}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="allowlist-pill mono">
+                      x402: {shortKey(X402_MERCHANT_PUBKEY.toBase58())}
+                    </span>
+                  )}
+                </div>
               </div>
             </div>
           </section>
+
+          <section
+            className="card trace-panel"
+            aria-labelledby="trace-log-heading"
+          >
+            <div className="card-header">
+              <h2 id="trace-log-heading">
+                Structured x402 Protocol &amp; On-Chain Trace Log
+              </h2>
+              <button
+                id="btn-clear-logs"
+                type="button"
+                className="btn"
+                onClick={() => setLogs([])}
+              >
+                Clear Log
+              </button>
+            </div>
+
+            <div className="trace-list" id="protocol-trace-list">
+              {logs.length === 0 ? (
+                <div className="trace-empty mono">
+                  Ready for live Solana Devnet execution. Click{" "}
+                  <strong>1. Setup Demo Vault &amp; Session</strong> on the left
+                  to drip Devnet SOL, mint disposable MockUSDC into your
+                  canonical Vault PDA, and walk through all 6 adversarial steps.
+                </div>
+              ) : (
+                logs.map((entry) => (
+                  <article key={entry.id} className="trace-card">
+                    <div className="trace-card-head">
+                      <span className="trace-title">{entry.title}</span>
+                      <div className="trace-head-right">
+                        <span
+                          className={`http-pill mono ${
+                            entry.tone === "ok"
+                              ? "http-pill-ok"
+                              : entry.tone === "trip"
+                              ? "http-pill-trip"
+                              : "http-pill-warn"
+                          }`}
+                        >
+                          {entry.badgeLabel}
+                        </span>
+                        <span className="trace-time mono">
+                          {entry.timestamp}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="trace-summary-grid">
+                      <div>
+                        <div className="trace-metric-label">On-Chain Delta</div>
+                        <div className="trace-metric-val mono">
+                          {entry.deltaSummary}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="trace-metric-label">Verified Mint</div>
+                        <div className="trace-metric-val mono">
+                          {entry.mintSummary}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="trace-metric-label">
+                          Receipt / Guard
+                        </div>
+                        <div className="trace-metric-val mono">
+                          {entry.receiptSummary}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="trace-metric-label">
+                          Solana Devnet Tx
+                        </div>
+                        <div className="trace-metric-val mono">
+                          {entry.txSig ? (
+                            <a
+                              href={explorerTxUrl(entry.txSig)}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              {shortKey(entry.txSig)} ↗
+                            </a>
+                          ) : (
+                            "HTTP-only (0 gas)"
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    <details className="trace-details">
+                      <summary className="mono">
+                        Inspect Raw HTTP / On-Chain Payload
+                      </summary>
+                      <pre className="trace-pre mono">{entry.rawJson}</pre>
+                    </details>
+                  </article>
+                ))
+              )}
+            </div>
+          </section>
         </div>
-
-        <section
-          className="console-panel"
-          aria-labelledby="verification-console-heading"
-        >
-          <div className="console-header">
-            <h2 id="verification-console-heading" className="mono">
-              HTTP 402 Challenge &amp; On-Chain Receipt Verification Log
-            </h2>
-            <button
-              id="btn-clear-logs"
-              type="button"
-              className="btn"
-              onClick={() => setLogs([])}
-            >
-              Clear
-            </button>
-          </div>
-
-          <div className="console-body">
-            {logs.length === 0 ? (
-              <div className="log-empty mono">
-                Awaiting action. Click Step 1 to auto-fund via /api/faucet (or
-                Devnet fallback) and initialize a live Vault &amp; Session, then
-                test Steps 2–5.
-              </div>
-            ) : (
-              logs.map((entry) => (
-                <article key={entry.id} className="log-entry">
-                  <div className="log-entry-head">
-                    <span
-                      className={`log-entry-title ${
-                        entry.tone === "ok"
-                          ? "log-tone-ok"
-                          : entry.tone === "trip"
-                          ? "log-tone-trip"
-                          : "log-tone-warn"
-                      }`}
-                    >
-                      {entry.title}
-                    </span>
-                    <span className="log-meta mono">{entry.timestamp}</span>
-                  </div>
-
-                  {entry.txSig && (
-                    <a
-                      className="log-tx-link mono"
-                      href={explorerTxUrl(entry.txSig)}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      Explorer Tx: {entry.txSig} ↗
-                    </a>
-                  )}
-
-                  <pre className="log-pre mono">{entry.detail}</pre>
-                </article>
-              ))
-            )}
-          </div>
-        </section>
       </div>
+
+      <section
+        id="architecture-diagram-section"
+        className="card arch-section"
+        aria-labelledby="arch-heading"
+      >
+        <div className="card-header">
+          <h2 id="arch-heading">
+            Why Naive <code>tx.meta.err == null</code> Fails &amp; How Leash
+            Closes the Non-Reverting x402 Trap
+          </h2>
+        </div>
+        <p className="arch-caption">
+          On Solana, reverting transactions roll back all state changes—so a
+          circuit breaker <strong>must</strong> return <code>Ok(())</code> to
+          persist <code>SessionStatus::Tripped</code> on-chain. Leash prevents
+          false-positive HTTP 200 unlocks by allocating canonical{" "}
+          <code>Receipt</code> PDAs only on the passing settlement path and
+          binding <code>Vault.mint</code> + atomic <code>SET NX EX</code>{" "}
+          single-use locks.
+        </p>
+
+        <div className="arch-svg-wrap">
+          <svg
+            className="arch-svg"
+            viewBox="0 0 1120 270"
+            role="img"
+            aria-label="Architecture comparison between naive tx.meta.err x402 verification and Leash Receipt PDA + Vault.mint + Atomic Replay verification"
+          >
+            <rect
+              x="8"
+              y="10"
+              width="1104"
+              height="114"
+              rx="8"
+              fill="#191113"
+              stroke="#5c2629"
+              strokeWidth="1.2"
+            />
+            <text
+              x="26"
+              y="34"
+              fill="#f87171"
+              fontSize="12.5"
+              fontWeight="700"
+              fontFamily="monospace"
+            >
+              VULNERABLE: NAIVE x402 VERIFIER (CHECKS tx.meta.err == null ONLY)
+            </text>
+
+            <rect
+              x="26"
+              y="48"
+              width="210"
+              height="60"
+              rx="6"
+              fill="#11161f"
+              stroke="#334155"
+            />
+            <text x="38" y="72" fill="#e2e8f0" fontSize="12" fontWeight="600">
+              Prompt-Injected Agent
+            </text>
+            <text x="38" y="92" fill="#94a3b8" fontSize="11" fontFamily="monospace">
+              spend(5.00 &gt; 0.50 max)
+            </text>
+
+            <line
+              x1="236"
+              y1="78"
+              x2="282"
+              y2="78"
+              stroke="#f87171"
+              strokeWidth="1.8"
+            />
+            <polygon points="282,78 274,73 274,83" fill="#f87171" />
+
+            <rect
+              x="286"
+              y="48"
+              width="275"
+              height="60"
+              rx="6"
+              fill="#11161f"
+              stroke="#5c2629"
+            />
+            <text x="298" y="72" fill="#fca5a5" fontSize="12" fontWeight="600">
+              Soft-Trip Commit: Ok(())
+            </text>
+            <text x="298" y="92" fill="#94a3b8" fontSize="11" fontFamily="monospace">
+              meta.err = null | 0 USDC moved
+            </text>
+
+            <line
+              x1="561"
+              y1="78"
+              x2="607"
+              y2="78"
+              stroke="#f87171"
+              strokeWidth="1.8"
+            />
+            <polygon points="607,78 599,73 599,83" fill="#f87171" />
+
+            <rect
+              x="611"
+              y="48"
+              width="245"
+              height="60"
+              rx="6"
+              fill="#11161f"
+              stroke="#5c2629"
+            />
+            <text x="623" y="72" fill="#e2e8f0" fontSize="12" fontWeight="600">
+              Naive Resource Server
+            </text>
+            <text x="623" y="92" fill="#94a3b8" fontSize="11" fontFamily="monospace">
+              if (tx.meta.err == null)
+            </text>
+
+            <line
+              x1="856"
+              y1="78"
+              x2="902"
+              y2="78"
+              stroke="#f87171"
+              strokeWidth="1.8"
+            />
+            <polygon points="902,78 894,73 894,83" fill="#f87171" />
+
+            <rect
+              x="906"
+              y="48"
+              width="190"
+              height="60"
+              rx="6"
+              fill="#3b1216"
+              stroke="#f87171"
+            />
+            <text x="920" y="73" fill="#fecaca" fontSize="12" fontWeight="700">
+              FALSE 200 OK BYPASS
+            </text>
+            <text x="920" y="92" fill="#fca5a5" fontSize="11" fontFamily="monospace">
+              Unpaid data leaked!
+            </text>
+
+            <rect
+              x="8"
+              y="144"
+              width="1104"
+              height="116"
+              rx="8"
+              fill="#0d1b18"
+              stroke="#1f5c4d"
+              strokeWidth="1.2"
+            />
+            <text
+              x="26"
+              y="168"
+              fill="#34d399"
+              fontSize="12.5"
+              fontWeight="700"
+              fontFamily="monospace"
+            >
+              LEASH HARDENED x402: RECEIPT PDA + VAULT.MINT BINDING + ATOMIC SET NX EX REPLAY GUARD
+            </text>
+
+            <rect
+              x="26"
+              y="182"
+              width="210"
+              height="62"
+              rx="6"
+              fill="#11161f"
+              stroke="#334155"
+            />
+            <text x="38" y="206" fill="#e2e8f0" fontSize="12" fontWeight="600">
+              Bounded Session Spend
+            </text>
+            <text x="38" y="226" fill="#94a3b8" fontSize="11" fontFamily="monospace">
+              All 7 policy checks pass
+            </text>
+
+            <line
+              x1="236"
+              y1="213"
+              x2="282"
+              y2="213"
+              stroke="#34d399"
+              strokeWidth="1.8"
+            />
+            <polygon points="282,213 274,208 274,218" fill="#34d399" />
+
+            <rect
+              x="286"
+              y="182"
+              width="275"
+              height="62"
+              rx="6"
+              fill="#11161f"
+              stroke="#1f5c4d"
+            />
+            <text x="298" y="206" fill="#6ee7b7" fontSize="12" fontWeight="600">
+              SPL Transfer + Receipt PDA
+            </text>
+            <text x="298" y="226" fill="#94a3b8" fontSize="11" fontFamily="monospace">
+              seeds=[&quot;receipt&quot;,vault,hash]
+            </text>
+
+            <line
+              x1="561"
+              y1="213"
+              x2="607"
+              y2="213"
+              stroke="#34d399"
+              strokeWidth="1.8"
+            />
+            <polygon points="607,213 599,208 599,218" fill="#34d399" />
+
+            <rect
+              x="611"
+              y="182"
+              width="245"
+              height="62"
+              rx="6"
+              fill="#11161f"
+              stroke="#1f5c4d"
+            />
+            <text x="623" y="206" fill="#e2e8f0" fontSize="12" fontWeight="600">
+              /api/x402/resource Verifier
+            </text>
+            <text x="623" y="226" fill="#94a3b8" fontSize="11" fontFamily="monospace">
+              Vault.mint + Slot + SET NX
+            </text>
+
+            <line
+              x1="856"
+              y1="213"
+              x2="902"
+              y2="213"
+              stroke="#34d399"
+              strokeWidth="1.8"
+            />
+            <polygon points="902,213 894,208 894,218" fill="#34d399" />
+
+            <rect
+              x="906"
+              y="182"
+              width="190"
+              height="62"
+              rx="6"
+              fill="#0f2f26"
+              stroke="#34d399"
+            />
+            <text x="920" y="207" fill="#a7f3d0" fontSize="12" fontWeight="700">
+              VERIFIED 200 OK
+            </text>
+            <text x="920" y="226" fill="#6ee7b7" fontSize="11" fontFamily="monospace">
+              Single-use settled!
+            </text>
+          </svg>
+        </div>
+      </section>
     </main>
   );
 }

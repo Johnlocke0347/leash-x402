@@ -1,88 +1,26 @@
 import {
   Connection,
-  Keypair,
   LAMPORTS_PER_SOL,
   PublicKey,
   SystemProgram,
   Transaction,
 } from "@solana/web3.js";
 import { NextRequest, NextResponse } from "next/server";
+import { loadServerFaucetKeypair } from "@/lib/faucet-key";
+import {
+  claimAtomicKey,
+  peekKeyTtlSeconds,
+  releaseAtomicKey,
+} from "@/lib/kv-store";
 import { DEFAULT_DEVNET_RPC } from "@/lib/leash-protocol";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 
 const FAUCET_DRIP_LAMPORTS = Math.floor(0.05 * LAMPORTS_PER_SOL); // 0.05 SOL
 const SKIP_THRESHOLD_LAMPORTS = Math.floor(0.08 * LAMPORTS_PER_SOL); // 0.08 SOL
-const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+const COOLDOWN_SECONDS = 5 * 60; // 5 minutes
 const FALLBACK_FAUCET_URL = "https://faucet.solana.com";
-
-const BASE58_ALPHABET =
-  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-// NOTE: In-memory per-IP & per-pubkey cooldown maps for single-instance / demo servers.
-// Multi-instance serverless deployments should store rate-limit keys in Redis / Vercel KV.
-const globalForFaucet = globalThis as unknown as {
-  __leashFaucetIpCooldowns?: Map<string, number>;
-  __leashFaucetPubkeyCooldowns?: Map<string, number>;
-};
-const ipCooldowns =
-  globalForFaucet.__leashFaucetIpCooldowns ?? new Map<string, number>();
-const pubkeyCooldowns =
-  globalForFaucet.__leashFaucetPubkeyCooldowns ?? new Map<string, number>();
-globalForFaucet.__leashFaucetIpCooldowns = ipCooldowns;
-globalForFaucet.__leashFaucetPubkeyCooldowns = pubkeyCooldowns;
-
-function pruneCooldowns(map: Map<string, number>, nowMs: number): void {
-  for (const [key, expiresAt] of map.entries()) {
-    if (expiresAt <= nowMs) {
-      map.delete(key);
-    }
-  }
-}
-
-function decodeBase58(input: string): Uint8Array {
-  let num = 0n;
-  for (let i = 0; i < input.length; i++) {
-    const charIdx = BASE58_ALPHABET.indexOf(input[i]);
-    if (charIdx < 0) {
-      throw new Error("Invalid base58 character in FAUCET_SECRET_KEY");
-    }
-    num = num * 58n + BigInt(charIdx);
-  }
-
-  const bytes: number[] = [];
-  while (num > 0n) {
-    bytes.push(Number(num & 0xffn));
-    num >>= 8n;
-  }
-  bytes.reverse();
-
-  let leadingZeros = 0;
-  while (leadingZeros < input.length && input[leadingZeros] === "1") {
-    leadingZeros++;
-  }
-
-  const result = new Uint8Array(leadingZeros + bytes.length);
-  result.set(bytes, leadingZeros);
-  return result;
-}
-
-function parseFaucetKeypair(rawSecret: string): Keypair {
-  const trimmed = rawSecret.trim();
-  if (trimmed.startsWith("[")) {
-    const parsed = JSON.parse(trimmed) as unknown;
-    if (
-      !Array.isArray(parsed) ||
-      parsed.length !== 64 ||
-      !parsed.every((n) => typeof n === "number" && n >= 0 && n <= 255)
-    ) {
-      throw new Error("FAUCET_SECRET_KEY JSON array must contain 64 bytes");
-    }
-    return Keypair.fromSecretKey(Uint8Array.from(parsed));
-  }
-  const decoded = decodeBase58(trimmed);
-  return Keypair.fromSecretKey(decoded);
-}
 
 function extractClientIp(request: NextRequest): string {
   const xff = request.headers.get("x-forwarded-for");
@@ -90,12 +28,28 @@ function extractClientIp(request: NextRequest): string {
     const first = xff.split(",")[0]?.trim();
     if (first) return first;
   }
-  return request.headers.get("x-real-ip")?.trim() || "unknown-ip";
+  return request.headers.get("x-real-ip")?.trim() || "local-ip";
 }
 
 export async function POST(request: NextRequest) {
-  const rawSecret = process.env.FAUCET_SECRET_KEY?.trim();
-  if (!rawSecret) {
+  let faucetKeypair;
+  try {
+    faucetKeypair = loadServerFaucetKeypair();
+  } catch (err: unknown) {
+    return NextResponse.json(
+      {
+        configured: false,
+        error:
+          err instanceof Error
+            ? err.message
+            : "Malformed server FAUCET_SECRET_KEY.",
+        fallbackUrl: FALLBACK_FAUCET_URL,
+      },
+      { status: 503 }
+    );
+  }
+
+  if (!faucetKeypair) {
     return NextResponse.json(
       {
         configured: false,
@@ -133,23 +87,6 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  let faucetKeypair: Keypair;
-  try {
-    faucetKeypair = parseFaucetKeypair(rawSecret);
-  } catch (err: unknown) {
-    return NextResponse.json(
-      {
-        configured: false,
-        error:
-          err instanceof Error
-            ? err.message
-            : "Malformed server FAUCET_SECRET_KEY.",
-        fallbackUrl: FALLBACK_FAUCET_URL,
-      },
-      { status: 503 }
-    );
-  }
-
   if (recipient.equals(faucetKeypair.publicKey)) {
     return NextResponse.json(
       { error: "Cannot request drip to faucet wallet itself." },
@@ -157,33 +94,36 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const nowMs = Date.now();
-  pruneCooldowns(ipCooldowns, nowMs);
-  pruneCooldowns(pubkeyCooldowns, nowMs);
-
   const clientIp = extractClientIp(request);
   const recipientStr = recipient.toBase58();
+  const ipKey = `leash:faucet:ip:${clientIp}`;
+  const pkKey = `leash:faucet:pk:${recipientStr}`;
 
-  const ipUntil = ipCooldowns.get(clientIp);
-  if (ipUntil && ipUntil > nowMs) {
+  const [ipCheck, pkCheck] = await Promise.all([
+    peekKeyTtlSeconds(ipKey),
+    peekKeyTtlSeconds(pkKey),
+  ]);
+
+  if (ipCheck.exists) {
     return NextResponse.json(
       {
         configured: true,
-        error: `IP cooldown active. Retry in ${Math.ceil((ipUntil - nowMs) / 1000)}s.`,
-        retryAfterSeconds: Math.ceil((ipUntil - nowMs) / 1000),
+        error: `IP cooldown active. Retry in ${ipCheck.ttlSeconds}s.`,
+        retryAfterSeconds: ipCheck.ttlSeconds,
+        storeMode: ipCheck.storeMode,
         fallbackUrl: FALLBACK_FAUCET_URL,
       },
       { status: 429 }
     );
   }
 
-  const pubkeyUntil = pubkeyCooldowns.get(recipientStr);
-  if (pubkeyUntil && pubkeyUntil > nowMs) {
+  if (pkCheck.exists) {
     return NextResponse.json(
       {
         configured: true,
-        error: `Wallet cooldown active. Retry in ${Math.ceil((pubkeyUntil - nowMs) / 1000)}s.`,
-        retryAfterSeconds: Math.ceil((pubkeyUntil - nowMs) / 1000),
+        error: `Wallet cooldown active. Retry in ${pkCheck.ttlSeconds}s.`,
+        retryAfterSeconds: pkCheck.ttlSeconds,
+        storeMode: pkCheck.storeMode,
         fallbackUrl: FALLBACK_FAUCET_URL,
       },
       { status: 429 }
@@ -227,59 +167,91 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const tx = new Transaction().add(
-      SystemProgram.transfer({
-        fromPubkey: faucetKeypair.publicKey,
-        toPubkey: recipient,
-        lamports: FAUCET_DRIP_LAMPORTS,
-      })
-    );
-    tx.feePayer = faucetKeypair.publicKey;
-    const latest = await connection.getLatestBlockhash("confirmed");
-    tx.recentBlockhash = latest.blockhash;
-    tx.sign(faucetKeypair);
+    // Atomically lock IP and pubkey cooldown keys before sending SOL
+    const ipLock = await claimAtomicKey(ipKey, COOLDOWN_SECONDS);
+    if (!ipLock.acquired) {
+      return NextResponse.json(
+        {
+          configured: true,
+          error: "Concurrent faucet cooldown active.",
+          retryAfterSeconds: COOLDOWN_SECONDS,
+          storeMode: ipLock.storeMode,
+          fallbackUrl: FALLBACK_FAUCET_URL,
+        },
+        { status: 429 }
+      );
+    }
 
-    const txSignature = await connection.sendRawTransaction(tx.serialize(), {
-      maxRetries: 5,
-    });
+    const pkLock = await claimAtomicKey(pkKey, COOLDOWN_SECONDS);
+    if (!pkLock.acquired) {
+      await releaseAtomicKey(ipKey);
+      return NextResponse.json(
+        {
+          configured: true,
+          error: "Concurrent wallet cooldown active.",
+          retryAfterSeconds: COOLDOWN_SECONDS,
+          storeMode: pkLock.storeMode,
+          fallbackUrl: FALLBACK_FAUCET_URL,
+        },
+        { status: 429 }
+      );
+    }
 
-    const deadline = Date.now() + 45_000;
-    let confirmed = false;
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 1200));
-      const statuses = await connection.getSignatureStatuses([txSignature]);
-      const st = statuses.value[0];
-      if (
-        st &&
-        (st.confirmationStatus === "confirmed" ||
-          st.confirmationStatus === "finalized")
-      ) {
-        if (st.err) {
-          throw new Error(`Faucet tx reverted: ${JSON.stringify(st.err)}`);
+    try {
+      const tx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: faucetKeypair.publicKey,
+          toPubkey: recipient,
+          lamports: FAUCET_DRIP_LAMPORTS,
+        })
+      );
+      tx.feePayer = faucetKeypair.publicKey;
+      const latest = await connection.getLatestBlockhash("confirmed");
+      tx.recentBlockhash = latest.blockhash;
+      tx.sign(faucetKeypair);
+
+      const txSignature = await connection.sendRawTransaction(tx.serialize(), {
+        maxRetries: 5,
+      });
+
+      const deadline = Date.now() + 45_000;
+      let confirmed = false;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 1200));
+        const statuses = await connection.getSignatureStatuses([txSignature]);
+        const st = statuses.value[0];
+        if (
+          st &&
+          (st.confirmationStatus === "confirmed" ||
+            st.confirmationStatus === "finalized")
+        ) {
+          if (st.err) {
+            throw new Error(`Faucet tx reverted: ${JSON.stringify(st.err)}`);
+          }
+          confirmed = true;
+          break;
         }
-        confirmed = true;
-        break;
       }
+
+      if (!confirmed) {
+        throw new Error(`Timed out confirming faucet transfer ${txSignature}`);
+      }
+
+      return NextResponse.json(
+        {
+          configured: true,
+          funded: true,
+          amountSol: FAUCET_DRIP_LAMPORTS / LAMPORTS_PER_SOL,
+          txSignature,
+          recipient: recipientStr,
+          storeMode: pkLock.storeMode,
+        },
+        { status: 200 }
+      );
+    } catch (sendErr: unknown) {
+      await Promise.all([releaseAtomicKey(ipKey), releaseAtomicKey(pkKey)]);
+      throw sendErr;
     }
-
-    if (!confirmed) {
-      throw new Error(`Timed out confirming faucet transfer ${txSignature}`);
-    }
-
-    const expiresAt = Date.now() + COOLDOWN_MS;
-    ipCooldowns.set(clientIp, expiresAt);
-    pubkeyCooldowns.set(recipientStr, expiresAt);
-
-    return NextResponse.json(
-      {
-        configured: true,
-        funded: true,
-        amountSol: FAUCET_DRIP_LAMPORTS / LAMPORTS_PER_SOL,
-        txSignature,
-        recipient: recipientStr,
-      },
-      { status: 200 }
-    );
   } catch (err: unknown) {
     return NextResponse.json(
       {
