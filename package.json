@@ -1,0 +1,27 @@
+{
+  "name": "leash-x402",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "test": "anchor test",
+    "devnet:smoke": "npx ts-node -P ./tsconfig.json scripts/devnet-smoke.ts"
+  },
+  "dependencies": {
+    "@anchor-lang/core": "^0.32.3",
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "1.99.0"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.5",
+    "@types/chai": "^4.3.16",
+    "@types/mocha": "^10.0.7",
+    "@types/node": "^22.0.0",
+    "chai": "^4.3.10",
+    "mocha": "^10.4.0",
+    "ts-mocha": "^10.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  }
+}
