@@ -31,10 +31,15 @@
 
 ---
 
-## 3. End-to-End Live HTTP `/api/x402/resource` Proof (`scripts/verify-x402-e2e.ts`)
+## 3. Hardened 5-Case Live HTTP `/api/x402/resource` Proof (`scripts/verify-x402-e2e.ts`)
 
-| HTTP Flow | Result | Devnet Explorer Link |
-| :--- | :--- | :--- |
-| **Unauthenticated `GET /api/x402/resource`** | `HTTP 402` challenge (`nonce = b9a981554c83dda2bd4cd8ec`) | — |
-| **Retry with Soft-Tripped Devnet Tx (`meta.err == null`)** | Rejected with `HTTP 402` (Receipt PDA `9bs6RNvwDPHZRXSCqhGutnRzNiLAtWr4AEwDH3HqYk67` absent on-chain) | [https://explorer.solana.com/tx/3pEuKA4vnhHR1r5puPk7oWby3nXJr2YysXwZas7eCC1foupy8qomi96mJ5UjwNnf8jgZshMXQEhHYt2sNdbKL7wV?cluster=devnet](https://explorer.solana.com/tx/3pEuKA4vnhHR1r5puPk7oWby3nXJr2YysXwZas7eCC1foupy8qomi96mJ5UjwNnf8jgZshMXQEhHYt2sNdbKL7wV?cluster=devnet) |
-| **Retry after Settled Devnet `execute_agent_spend`** | Verified canonical `Receipt` PDA (`3vN531QXPZwf9B4CzWajnJnD3S4P4qLgEpWpF28w4aF7`) -> `HTTP 200 OK` | [https://explorer.solana.com/tx/2SYVixyvj4m4HarKHD6RgK2VU49aPGU1ZsbRhVXBD69wWSW8KKrw4EZHsgEH2tvvnnUqutCSbZ2Bz1L6vVDwsVgG?cluster=devnet](https://explorer.solana.com/tx/2SYVixyvj4m4HarKHD6RgK2VU49aPGU1ZsbRhVXBD69wWSW8KKrw4EZHsgEH2tvvnnUqutCSbZ2Bz1L6vVDwsVgG?cluster=devnet) |
+Canonical mint-bound preimage enforced by `/api/x402/resource` (`x402-leash-v2`):  
+`sha256("${method}|${path}|${merchant}|${mint}|${amount}|${nonce}")`
+
+| Case | Adversarial / Settlement Scenario | Verified HTTP & On-Chain Result | Devnet Explorer Link |
+| :--- | :--- | :--- | :--- |
+| **1** | Unauthenticated `GET /api/x402/resource?mint=<mockUsdc>` | `HTTP 402` challenge with `mint` bound in JSON & `canonicalPreimage` | — |
+| **2** | Soft-Tripped Devnet Tx (`meta.err == null`, `0` Receipt PDA) | Rejected with `HTTP 402` (Receipt PDA `HgFACw7Af3WdbLgYWhY3J1gtzVosbsAaX3nCRwTmzDuF` absent on-chain) | [https://explorer.solana.com/tx/2UT7jbr99LYsYyMmJCvmbzkHSgKKwy6Q6cVWEhyAKMEVgLa1Md25b49hu5TAkkzZgZhL6RXEzgHp6EyVaV7mNZFS?cluster=devnet](https://explorer.solana.com/tx/2UT7jbr99LYsYyMmJCvmbzkHSgKKwy6Q6cVWEhyAKMEVgLa1Md25b49hu5TAkkzZgZhL6RXEzgHp6EyVaV7mNZFS?cluster=devnet) |
+| **3** | **Fake-Mint Attack** (Real `Receipt` PDA settled via FakeMint `67kYCsJM...` on Vault `kH5QjRSE...`) | Rejected with `HTTP 402` (`Mint mismatch: on-chain Vault settles 67kYCsJM..., expected 6PwHwMff...`) | [https://explorer.solana.com/tx/5N587Ups9497y8zrMKeounu7cqgL1PCEPC1X24MLmexGLzDSUD4USm7GqxKPs4aE3ioXtsRa4EzDxQrpuJzcdnJe?cluster=devnet](https://explorer.solana.com/tx/5N587Ups9497y8zrMKeounu7cqgL1PCEPC1X24MLmexGLzDSUD4USm7GqxKPs4aE3ioXtsRa4EzDxQrpuJzcdnJe?cluster=devnet) |
+| **4** | **Valid Mint-Bound Settlement** (`execute_agent_spend` matching `mint` + `request_hash`) | Dual `Vault` + `Receipt` PDA (`EQSXaksd2hXDh2Lc1NZmXAa6pG378M8ZQUZYgU3Q2cjr`) verified -> `HTTP 200 OK` | [https://explorer.solana.com/tx/4sBHU3fGz4PLXYqXJVapnzdUrqB6PGDyRnfDJ1eK7HT9LVd4GFShygfxWa6BxEXnzGCz7aVc781ijYvJmSfDuN6R?cluster=devnet](https://explorer.solana.com/tx/4sBHU3fGz4PLXYqXJVapnzdUrqB6PGDyRnfDJ1eK7HT9LVd4GFShygfxWa6BxEXnzGCz7aVc781ijYvJmSfDuN6R?cluster=devnet) |
+| **5** | **Immediate Replay** of Redeemed Receipt Headers from Case 4 | Rejected with `HTTP 402` (`Receipt already redeemed — single-use x402 settlement enforced.`) | — |

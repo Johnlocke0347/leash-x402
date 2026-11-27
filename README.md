@@ -12,13 +12,15 @@ Leash is a non-custodial Solana Anchor protocol that isolates autonomous agent h
 
 Autonomous agents executing HTTP `402 Payment Required` workflows hold hot signing keys in untrusted runtime environments exposed to indirect prompt injection, malicious tool responses, and compromised upstream APIs:
 
-| Attack Vector | On-Chain Defense in Leash |
+| Attack Vector | On-Chain & Verifier Defense in Leash |
 | :--- | :--- |
 | **Prompt-Injection Vault Drain** (`amount > max_per_tx`) | Soft-trips session (`TripReason::ExceedsPerTxMax`), moves `0` tokens, allocates `0` receipt rent, permanently locks session. |
 | **Salami-Slicing Retry After Trip** | Terminal gate: once `status != Active`, every subsequent `execute_agent_spend` (even `1` base unit) hard-reverts with `VaultError::SessionNotActive`. |
 | **Exfiltration to Rogue Merchant / Spoofed ATA** | Enforces owner-curated `allowlist` (max 16 unique pubkeys) AND verifies `merchant_ata.owner == merchant`, `merchant_ata.mint == vault.mint`, and `merchant_ata.delegate.is_none()`. |
 | **2x Boundary Burst Rate-Limit Bypass** | Continuous `u128` linear leaky-bucket refill eliminates fixed/tumbling window boundary resets. |
-| **Non-Reverting `x402` Settlement Spoofing** | Canonical `Receipt` PDA is allocated **only** on the passing settlement path; resource servers verify the `Receipt` PDA on-chain rather than `tx.meta.err == null`. |
+| **Non-Reverting `x402` Settlement Spoofing** | Canonical `Receipt` PDA is allocated **only** on the passing settlement path; `/api/x402/resource` verifies the `Receipt` PDA on-chain rather than `tx.meta.err == null`. |
+| **Fake-Mint `x402` Vault Substitution** | Challenge binds `mint` in `sha256(method\|path\|merchant\|mint\|amount\|nonce)` AND `/api/x402/resource` fetches both `Receipt` and `Vault` (`receipt.vault`) on-chain to verify `vault.mint == expectedMint`. |
+| **Single-Challenge Receipt Replay** | `/api/x402/resource` tracks redeemed `request_hash` digests and rejects repeat redemptions with `HTTP 402` (`Receipt already redeemed`). |
 | **Pre-Funded / Dusted `Receipt` PDA DoS** | Uses `create_account` when `lamports == 0`, and falls back to `transfer` shortfall + `allocate` + `assign` signed by `Receipt` PDA seeds when pre-funded with dust lamports. |
 | **Vault Owner SOL Fee-Griefing & State Bloat** | `agent_signer` signs and pays tx fees + `Receipt` rent; expired `Receipt` and idle/tripped `Session` PDAs are permissionlessly reapable back to their original rent payers. |
 | **Global Emergency Incident** | `set_pause(true)` trips any active agent spend (`VaultPaused`) while `owner_withdraw` remains live at all times. |
@@ -52,15 +54,18 @@ Over any arbitrary interval $\Delta t$, total outflow is strictly upper-bounded 
 
 ---
 
-## 4. Closing the Non-Reverting `x402` Verification Trap
+## 4. Closing the Non-Reverting `x402` Trap, Fake-Mint Bypass & Replay Window
 
-On Solana, if an instruction returns `Err(...)`, the runtime rolls back **all** state mutations—making it impossible to persist `session.status = SessionStatus::Tripped` on-chain during a reverting transaction. Consequently, Leash's policy-violation branch mutates `Session` to `Tripped`, emits `CircuitBreakerTripped`, transfers `0` tokens, and returns `Ok(())` (`tx.meta.err == null`).
-
-A naive `x402` resource server that only checks `tx.meta.err == null` would be tricked into serving paid data on a `0`-token circuit-breaker trip. Leash eliminates this trap:
-- `ExecuteAgentSpend` takes `receipt` as an `UncheckedAccount` verified against canonical seeds `[b"receipt", vault.key().as_ref(), &request_hash]`.
-- On any policy failure, `execute_agent_spend` returns `Ok(())` **without** creating or initializing the `Receipt` account.
-- Only when all 7 policy checks and SPL `transfer_checked` succeed does the program allocate and serialize the `Receipt` discriminator + payload.
-- Resource servers (`/api/x402/resource`) verify the on-chain `Receipt` PDA directly (owner, discriminator, canonical bump, `vault`, `merchant`, `amount`, `request_hash`, and `clock.slot < expiry_slot`).
+1. **Mint-Bound Challenge Preimage:**  
+   `/api/x402/resource` computes:
+   ```text
+   request_hash = sha256("${method}|${path}|${merchant}|${mint}|${amount}|${nonce}")
+   ```
+   By default (`ALLOW_SANDBOX_MOCK_MINT !== "true"`), `mint` is locked to `EXPECTED_MINT` (defaulting to Solana Devnet USDC `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU`). Only when `ALLOW_SANDBOX_MOCK_MINT="true"` may a caller supply a sandbox MockUSDC mint via `?mint=` / `X-402-Mint`.
+2. **Dual On-Chain `Vault` + `Receipt` PDA Verification:**  
+   Because soft-tripped spends commit `SessionStatus::Tripped` in a non-reverting `Ok(())` transaction (`tx.meta.err == null`), `/api/x402/resource` never trusts transaction status alone. It fetches **both** the canonical `Receipt` PDA (`[b"receipt", vault, request_hash]`) and `Vault` PDA (`receipt.vault`) from Solana Devnet, verifying program ownership (`Gyka77keaTzBgPj12CrqEJFoZpZodjh1tzHeERAP9ZRH`), canonical bumps, `receipt.vault == headerVault`, `vault.mint == expectedMint`, `receipt.merchant == expectedMerchant`, `receipt.amount == expectedAmount`, `receipt.requestHash == expectedHash`, and `currentSlot < receipt.expirySlot`.
+3. **Single-Use Replay Store Caveat:**  
+   `/api/x402/resource` maintains a TTL-pruned in-memory `Map<string, number>` of redeemed `requestHashHex` digests so each `Receipt` PDA can unlock a resource only once (`HTTP 402` `"Receipt already redeemed"` on replay). **Production Serverless Note:** In multi-instance or multi-region serverless deployments (such as Vercel), cold starts or separate isolates do not share in-memory `Map` state; production deployments must swap this map for an atomic distributed store such as Upstash Redis or Vercel KV (`SET receipt:<hash> 1 NX PX <ttl>`).
 
 ---
 
@@ -74,12 +79,25 @@ Full details and public keys are recorded in [`DEVNET_PROOF.md`](./DEVNET_PROOF.
 | **(b) Prompt-Injection Drain Trip** | `Ok(())`, **0 tokens moved**, no `Receipt` PDA, `Tripped (ExceedsPerTxMax)` | [View Tx (`2BMpcD3V...`)](https://explorer.solana.com/tx/2BMpcD3V28hGN6PngMG3y5zKjQzHYLCUpVMgh7r9wvaLxzwfJPgTgtp3jjzs2dFwUTcsaQyBRWjNXMkrebPRBByg?cluster=devnet) |
 | **(c) Salami Retry Hard-Revert** | `100` unit retry hard-reverted on-chain (`Custom(6010) / SessionNotActive`) | [View Tx (`8kdt5Vr9...`)](https://explorer.solana.com/tx/8kdt5Vr9Rv5GR9HSNQT1pGutxHVVi7yoE6414Z3jm2WRM1oGiejDXeKVoqn3FmX4yzZxSkxnWEYXHaLyrcxZtZL?cluster=devnet) |
 | **(d) Permissionless Reap Session** | Third-party keeper closed `Session` PDA & returned full rent to `vault.owner` | [View Tx (`5ihDcDsr...`)](https://explorer.solana.com/tx/5ihDcDsrCvppfHVuVoxnQXi1Wzc3ktzSA4DsxAtWTW9hV49hZ7Eq1ypw9qi4Bmue1ccXX3mPncx23F3zcEW5YV1X?cluster=devnet) |
-| **(e) Live HTTP `x402` Tripped Bypass Rejected** | Non-reverting tripped tx (`meta.err == null`) rejected by `/api/x402/resource` with `HTTP 402` | [View Tx (`3pEuKA4v...`)](https://explorer.solana.com/tx/3pEuKA4vnhHR1r5puPk7oWby3nXJr2YysXwZas7eCC1foupy8qomi96mJ5UjwNnf8jgZshMXQEhHYt2sNdbKL7wV?cluster=devnet) |
-| **(f) Live HTTP `x402` Receipt Verified (`200 OK`)** | `/api/x402/resource` verified `Receipt` PDA (`3vN531QXPZwf9B4CzWajnJnD3S4P4qLgEpWpF28w4aF7`) -> `HTTP 200 OK` | [View Tx (`2SYVixyv...`)](https://explorer.solana.com/tx/2SYVixyvj4m4HarKHD6RgK2VU49aPGU1ZsbRhVXBD69wWSW8KKrw4EZHsgEH2tvvnnUqutCSbZ2Bz1L6vVDwsVgG?cluster=devnet) |
+| **(e) HTTP `x402` Soft-Trip Spoof Rejected** | Non-reverting tripped tx (`meta.err == null`) rejected by `/api/x402/resource` with `HTTP 402` | [View Tx (`2UT7jbr9...`)](https://explorer.solana.com/tx/2UT7jbr99LYsYyMmJCvmbzkHSgKKwy6Q6cVWEhyAKMEVgLa1Md25b49hu5TAkkzZgZhL6RXEzgHp6EyVaV7mNZFS?cluster=devnet) |
+| **(f) HTTP `x402` Fake-Mint Attack Rejected** | Real `Receipt` PDA settled via worthless `FakeMint` Vault rejected with `HTTP 402` (`Mint mismatch`) | [View Tx (`5N587Ups...`)](https://explorer.solana.com/tx/5N587Ups9497y8zrMKeounu7cqgL1PCEPC1X24MLmexGLzDSUD4USm7GqxKPs4aE3ioXtsRa4EzDxQrpuJzcdnJe?cluster=devnet) |
+| **(g) HTTP `x402` Vault + Receipt Verified (`200 OK`)** | Dual `Vault.mint` + `Receipt` PDA (`EQSXaksd...`) verified -> `HTTP 200 OK` (and `402` on replay) | [View Tx (`4sBHU3fG...`)](https://explorer.solana.com/tx/4sBHU3fGz4PLXYqXJVapnzdUrqB6PGDyRnfDJ1eK7HT9LVd4GFShygfxWa6BxEXnzGCz7aVc781ijYvJmSfDuN6R?cluster=devnet) |
 
 ---
 
-## 6. Local Run Instructions (3 Commands)
+## 6. Deploying the Judge Sandbox to Vercel
+
+1. Import `Johnlocke0347/leash-x402` in Vercel and set **Root Directory** to **`app`**.
+2. Configure environment variables (see [`app/.env.example`](./app/.env.example)):
+   - `NEXT_PUBLIC_SOLANA_RPC_URL` — Public Devnet RPC URL (e.g., Helius/Triton Devnet URL or `https://api.devnet.solana.com`).
+   - `SOLANA_RPC_URL` — Server-side Devnet RPC URL used by `/api/x402/resource` and `/api/faucet`.
+   - `EXPECTED_MINT` — Default enforced SPL mint (`4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU` for Devnet USDC).
+   - `ALLOW_SANDBOX_MOCK_MINT` — Set to `"true"` on Judge Sandbox previews so browser-minted MockUSDC vaults are accepted.
+   - `FAUCET_SECRET_KEY` *(optional, server-only — never `NEXT_PUBLIC_`)* — JSON 64-byte array or base58 secret key of a Devnet SOL wallet to auto-drip `0.05 SOL` during Step 1 (`< 0.04 SOL` total setup + agent stipend). If omitted, `/api/faucet` returns `HTTP 503` and the UI falls back cleanly to `requestAirdrop` and `https://faucet.solana.com`.
+
+---
+
+## 7. Local Run Instructions (3 Commands)
 
 ```bash
 # 1. Install root dependencies and run the 12-case localnet adversarial exploit suite
@@ -89,5 +107,5 @@ npm install && anchor test
 npm install --prefix app && npm run build --prefix app
 
 # 3. Launch the Judge Sandbox UI at http://localhost:3000
-npm run dev --prefix app
+ALLOW_SANDBOX_MOCK_MINT=true npm run dev --prefix app
 ```

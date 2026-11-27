@@ -14,6 +14,10 @@ export const DEFAULT_DEVNET_RPC =
 
 export const LEASH_PROGRAM_ID = new PublicKey(leashIdl.address);
 
+export const DEVNET_USDC_MINT = new PublicKey(
+  "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+);
+
 // Deterministic canonical x402 Merchant PDA (off-curve wallet owning standard SPL ATA; zero private keys stored)
 export const X402_MERCHANT_PUBKEY = PublicKey.findProgramAddressSync(
   [new TextEncoder().encode("x402-merchant-v1")],
@@ -24,6 +28,17 @@ export const X402_CHALLENGE_AMOUNT = 250_000n; // 0.250000 USDC (6 decimals)
 export const X402_DRAIN_AMOUNT = 5_000_000n; // 5.000000 USDC (10x max_per_tx)
 export const X402_SALAMI_AMOUNT = 100n; // 0.000100 USDC
 export const X402_RECEIPT_TTL_SLOTS = 300n;
+
+export function formatX402CanonicalPreimage(params: {
+  method: string;
+  path: string;
+  merchant: string;
+  mint: string;
+  amount: string;
+  nonce: string;
+}): string {
+  return `${params.method}|${params.path}|${params.merchant}|${params.mint}|${params.amount}|${params.nonce}`;
+}
 
 const enc = new TextEncoder();
 

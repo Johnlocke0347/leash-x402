@@ -18,6 +18,8 @@ next-env.d.ts
 
 # Secrets, Environment & Keypairs (NON-NEGOTIABLE)
 .env*
+!.env.example
+!app/.env.example
 .devnet-keys/
 *keypair*.json
 *-devnet.json

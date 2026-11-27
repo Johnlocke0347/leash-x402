@@ -19,10 +19,10 @@ import {
 } from "@solana/web3.js";
 import {
   DEFAULT_DEVNET_RPC,
+  DEVNET_USDC_MINT,
   DecodedSession,
   DecodedVault,
   LEASH_PROGRAM_ID,
-  X402_CHALLENGE_AMOUNT,
   X402_DRAIN_AMOUNT,
   X402_MERCHANT_PUBKEY,
   X402_RECEIPT_TTL_SLOTS,
@@ -47,6 +47,9 @@ const LS_OWNER_KEY = "leash_judge_owner_keypair_v1";
 const LS_AGENT_KEY = "leash_judge_agent_keypair_v1";
 const LS_ACTIVE_SESSION_KEY = "leash_judge_active_session_v1";
 
+// Fits total Setup rent (~0.0128 SOL) + Agent stipend (0.015 SOL) = ~0.0278 SOL (< 0.04 SOL)
+const AGENT_STIPEND_SOL = 0.015;
+
 type LogTone = "ok" | "trip" | "warn";
 
 interface SandboxLogEntry {
@@ -56,6 +59,13 @@ interface SandboxLogEntry {
   tone: LogTone;
   txSig?: string;
   detail: string;
+}
+
+interface RedeemedReceiptContext {
+  vault: string;
+  mint: string;
+  nonce: string;
+  txSig: string;
 }
 
 function loadOrCreateBrowserKeypair(storageKey: string): Keypair {
@@ -144,6 +154,11 @@ export default function JudgeSandbox() {
   const [sessionState, setSessionState] = useState<DecodedSession | null>(null);
   const [sessionReaped, setSessionReaped] = useState<boolean>(false);
 
+  const [verifiedMint, setVerifiedMint] = useState<string | null>(null);
+  const [verifiedMintMode, setVerifiedMintMode] = useState<string | null>(null);
+  const [lastRedeemed, setLastRedeemed] =
+    useState<RedeemedReceiptContext | null>(null);
+
   const [nowSec, setNowSec] = useState<bigint>(
     BigInt(Math.floor(Date.now() / 1000))
   );
@@ -169,7 +184,6 @@ export default function JudgeSandbox() {
     []
   );
 
-  // Initialize ephemeral browser-only Devnet keypairs from localStorage
   useEffect(() => {
     const owner = loadOrCreateBrowserKeypair(LS_OWNER_KEY);
     const agent = loadOrCreateBrowserKeypair(LS_AGENT_KEY);
@@ -186,7 +200,6 @@ export default function JudgeSandbox() {
     }
   }, []);
 
-  // Continuous 1s clock ticker for real-time leaky-bucket refill visualization
   useEffect(() => {
     const timer = window.setInterval(() => {
       setNowSec(BigInt(Math.floor(Date.now() / 1000)));
@@ -290,6 +303,9 @@ export default function JudgeSandbox() {
     setSessionState(null);
     setActiveSessionAddress(null);
     setSessionReaped(false);
+    setVerifiedMint(null);
+    setVerifiedMintMode(null);
+    setLastRedeemed(null);
     appendLog({
       title: "Rotated Ephemeral Browser Keypairs",
       tone: "warn",
@@ -297,50 +313,133 @@ export default function JudgeSandbox() {
     });
   };
 
+  // Judge-proof Devnet funding: tries server /api/faucet first (0.05 SOL), then falls back to RPC requestAirdrop
+  const fundWalletWithFallback = useCallback(
+    async (
+      pubkey: PublicKey,
+      roleLabel: string
+    ): Promise<{ ok: boolean; txSig?: string }> => {
+      try {
+        const faucetRes = await fetch("/api/faucet", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pubkey: pubkey.toBase58() }),
+        });
+        const faucetBody = await faucetRes.json();
+
+        if (faucetRes.ok && (faucetBody.funded || faucetBody.skipped)) {
+          setFaucetThrottled(false);
+          appendLog({
+            title: faucetBody.funded
+              ? `Server Faucet Funded ${roleLabel} (+${faucetBody.amountSol} SOL)`
+              : `Server Faucet Check (${roleLabel})`,
+            tone: "ok",
+            txSig: faucetBody.txSignature,
+            detail: JSON.stringify(faucetBody, null, 2),
+          });
+          return { ok: true, txSig: faucetBody.txSignature };
+        }
+      } catch {
+        // Proceed to public RPC requestAirdrop fallback
+      }
+
+      try {
+        const sig = await connection.requestAirdrop(
+          pubkey,
+          Math.floor(0.5 * LAMPORTS_PER_SOL)
+        );
+        const deadline = Date.now() + 45_000;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 1200));
+          const st = (await connection.getSignatureStatuses([sig])).value[0];
+          if (
+            st &&
+            (st.confirmationStatus === "confirmed" ||
+              st.confirmationStatus === "finalized")
+          ) {
+            break;
+          }
+        }
+        setFaucetThrottled(false);
+        appendLog({
+          title: `Devnet RPC Airdrop Confirmed (${roleLabel}: +0.50 SOL)`,
+          tone: "ok",
+          txSig: sig,
+          detail: `Recipient: ${pubkey.toBase58()}`,
+        });
+        return { ok: true, txSig: sig };
+      } catch (err: unknown) {
+        setFaucetThrottled(true);
+        const msg = err instanceof Error ? err.message : String(err);
+        appendLog({
+          title: `Devnet Faucet Fallback Required (${roleLabel})`,
+          tone: "warn",
+          detail: `Server /api/faucet unconfigured (503) and public RPC throttled: ${msg}\nCopy ${pubkey.toBase58()} and request Devnet SOL at https://faucet.solana.com.`,
+        });
+        return { ok: false };
+      }
+    },
+    [appendLog, connection]
+  );
+
   const handleAirdrop = async (target: "owner" | "agent") => {
     if (!ownerKeypair || !agentKeypair) return;
     const pubkey =
       target === "owner" ? ownerKeypair.publicKey : agentKeypair.publicKey;
     setBusyAction(`airdrop-${target}`);
     try {
-      const sig = await connection.requestAirdrop(pubkey, 1 * LAMPORTS_PER_SOL);
-      const bh = await connection.getLatestBlockhash("confirmed");
-      await connection.confirmTransaction({ signature: sig, ...bh }, "confirmed");
-      setFaucetThrottled(false);
+      await fundWalletWithFallback(pubkey, target.toUpperCase());
       await refreshOnChainState();
-      appendLog({
-        title: `Devnet Airdrop Confirmed (${target.toUpperCase()}: +1.00 SOL)`,
-        tone: "ok",
-        txSig: sig,
-        detail: `Recipient: ${pubkey.toBase58()}`,
-      });
-    } catch (err: unknown) {
-      setFaucetThrottled(true);
-      const msg = err instanceof Error ? err.message : String(err);
-      appendLog({
-        title: `Public Devnet RPC Airdrop Throttled (${target.toUpperCase()})`,
-        tone: "warn",
-        detail: `RPC returned rate-limit/410: ${msg}\nFallback: Copy the Owner pubkey (${ownerKeypair.publicKey.toBase58()}) and request Devnet SOL at https://faucet.solana.com. Setup Demo automatically funds Agent from Owner.`,
-      });
     } finally {
       setBusyAction(null);
     }
   };
 
-  // ACTION 1: Setup Demo Vault & Session
+  // ACTION 1: Setup Demo Vault & Session (total setup + agent stipend < 0.04 SOL)
   const handleSetupDemo = async () => {
     if (!ownerKeypair || !agentKeypair) return;
     setBusyAction("setup");
     try {
+      // Auto-fund Owner via /api/faucet -> requestAirdrop if balance < 0.035 SOL
+      const initialOwnerLamports = await connection.getBalance(
+        ownerKeypair.publicKey,
+        "confirmed"
+      );
+      if (initialOwnerLamports < Math.floor(0.035 * LAMPORTS_PER_SOL)) {
+        const funded = await fundWalletWithFallback(
+          ownerKeypair.publicKey,
+          "OWNER"
+        );
+        const postFundLamports = await connection.getBalance(
+          ownerKeypair.publicKey,
+          "confirmed"
+        );
+        setOwnerSol(postFundLamports / LAMPORTS_PER_SOL);
+        if (
+          !funded.ok &&
+          postFundLamports < Math.floor(0.03 * LAMPORTS_PER_SOL)
+        ) {
+          throw new Error(
+            `Owner wallet (${ownerKeypair.publicKey.toBase58()}) needs >= 0.04 Devnet SOL. Click "Copy Pubkey" above and request SOL at https://faucet.solana.com.`
+          );
+        }
+      }
+
       const programInfo = await connection.getAccountInfo(
         LEASH_PROGRAM_ID,
         "confirmed"
       );
       if (!programInfo) {
         throw new Error(
-          `Leash program (${LEASH_PROGRAM_ID.toBase58()}) is not yet deployed on this cluster. Fund deployer 2SLiJHDx9SmJn4TLKJuDAPoH1T2QLviD5giXTnmXoifB on faucet.solana.com and run ./scripts/deploy-devnet.sh.`
+          `Leash program (${LEASH_PROGRAM_ID.toBase58()}) was not found on this RPC endpoint.`
         );
       }
+
+      const currentAgentLamports = await connection.getBalance(
+        agentKeypair.publicKey,
+        "confirmed"
+      );
+      const currentAgentSol = currentAgentLamports / LAMPORTS_PER_SOL;
 
       const [vaultPda] = deriveVaultPda(ownerKeypair.publicKey);
       const existingVaultInfo = await connection.getAccountInfo(
@@ -366,12 +465,12 @@ export default function JudgeSandbox() {
           await connection.getMinimumBalanceForRentExemption(MINT_SIZE);
 
         const tx1 = new Transaction();
-        if (agentSol < 0.05) {
+        if (currentAgentSol < 0.01) {
           tx1.add(
             SystemProgram.transfer({
               fromPubkey: ownerKeypair.publicKey,
               toPubkey: agentKeypair.publicKey,
-              lamports: Math.floor(0.08 * LAMPORTS_PER_SOL),
+              lamports: Math.floor(AGENT_STIPEND_SOL * LAMPORTS_PER_SOL),
             })
           );
         }
@@ -429,12 +528,12 @@ export default function JudgeSandbox() {
         );
 
         const prepTx = new Transaction();
-        if (agentSol < 0.05) {
+        if (currentAgentSol < 0.01) {
           prepTx.add(
             SystemProgram.transfer({
               fromPubkey: ownerKeypair.publicKey,
               toPubkey: agentKeypair.publicKey,
-              lamports: Math.floor(0.08 * LAMPORTS_PER_SOL),
+              lamports: Math.floor(AGENT_STIPEND_SOL * LAMPORTS_PER_SOL),
             })
           );
         }
@@ -512,6 +611,7 @@ export default function JudgeSandbox() {
             vaultPda: vaultPda.toBase58(),
             sessionPda: sessionPda.toBase58(),
             mockUsdcMint: mintPubkey.toBase58(),
+            agentStipendSol: AGENT_STIPEND_SOL,
             allowlistedX402Merchant: X402_MERCHANT_PUBKEY.toBase58(),
             policy: {
               maxPerTxUsdc: "0.50",
@@ -537,17 +637,30 @@ export default function JudgeSandbox() {
     }
   };
 
-  // ACTION 2: Normal x402 Payment (402 -> Pay -> Receipt Verified -> 200 OK)
+  // ACTION 2: Normal x402 Payment (402 -> Pay -> Vault+Receipt Verified -> 200 OK)
   const handleNormalX402 = async () => {
     if (!agentKeypair || !vaultState || !activeSessionAddress) return;
     setBusyAction("normal-x402");
     try {
-      // Step 1: Request protected resource -> receive HTTP 402 challenge
-      const res402 = await fetch("/api/x402/resource", { cache: "no-store" });
+      const mintStr = vaultState.mint.toBase58();
+      // Step 1: Request protected resource with sandbox mint -> receive mint-bound HTTP 402 challenge
+      const res402 = await fetch(
+        `/api/x402/resource?mint=${encodeURIComponent(mintStr)}`,
+        {
+          cache: "no-store",
+          headers: { "X-402-Mint": mintStr },
+        }
+      );
       const body402 = await res402.json();
       const challenge = body402.challenge;
-      const requestHashBytes = hexToBytes(challenge.requestHashHex);
+      if (challenge.mint !== mintStr) {
+        throw new Error(
+          body402.reason ||
+            `Server strictly enforces EXPECTED_MINT ${challenge.mint}. Set ALLOW_SANDBOX_MOCK_MINT=true for MockUSDC demo.`
+        );
+      }
 
+      const requestHashBytes = hexToBytes(challenge.requestHashHex);
       const [receiptPda] = deriveReceiptPda(vaultState.address, requestHashBytes);
       const merchantPubkey = new PublicKey(challenge.merchant);
       const merchantAta = getAssociatedTokenAddressSync(
@@ -579,27 +692,41 @@ export default function JudgeSandbox() {
         agentKeypair
       );
 
-      // Step 3: Retry /api/x402/resource with Receipt verification headers
+      // Step 3: Retry /api/x402/resource with Vault + Mint + Nonce headers
       const res200 = await fetch("/api/x402/resource", {
         cache: "no-store",
         headers: {
           "X-402-Vault": vaultState.address.toBase58(),
+          "X-402-Mint": mintStr,
           "X-402-Nonce": challenge.nonce,
           "X-402-Tx-Signature": txSig,
-          "X-402-Rpc-Url": rpcUrl,
         },
       });
       const body200 = await res200.json();
+
+      if (res200.status === 200 && body200.verificationProof) {
+        setVerifiedMint(body200.verificationProof.mint ?? null);
+        setVerifiedMintMode(
+          body200.verificationProof.mintVerificationMode ?? null
+        );
+        setLastRedeemed({
+          vault: vaultState.address.toBase58(),
+          mint: mintStr,
+          nonce: challenge.nonce,
+          txSig,
+        });
+      }
+
       await refreshOnChainState();
 
       appendLog({
-        title: `2. Normal x402 Payment -> HTTP ${res402.status} -> Receipt Verified -> HTTP ${res200.status}`,
+        title: `2. Normal x402 Payment -> HTTP ${res402.status} -> Vault+Receipt Verified -> HTTP ${res200.status}`,
         tone: res200.status === 200 ? "ok" : "trip",
         txSig,
         detail:
-          `--- [1] HTTP ${res402.status} Challenge ---\n` +
+          `--- [1] HTTP ${res402.status} Mint-Bound Challenge ---\n` +
           `${JSON.stringify(body402.challenge, null, 2)}\n\n` +
-          `--- [2] HTTP ${res200.status} On-Chain Receipt PDA Verification ---\n` +
+          `--- [2] HTTP ${res200.status} On-Chain Vault + Receipt PDA Verification ---\n` +
           `${JSON.stringify(body200, null, 2)}`,
       });
     } catch (err: unknown) {
@@ -615,12 +742,53 @@ export default function JudgeSandbox() {
     }
   };
 
+  // ACTION 2b: Replay Same Receipt (Must Reject 402)
+  const handleReplayReceipt = async () => {
+    if (!lastRedeemed) return;
+    setBusyAction("replay");
+    try {
+      const replayRes = await fetch("/api/x402/resource", {
+        cache: "no-store",
+        headers: {
+          "X-402-Vault": lastRedeemed.vault,
+          "X-402-Mint": lastRedeemed.mint,
+          "X-402-Nonce": lastRedeemed.nonce,
+          "X-402-Tx-Signature": lastRedeemed.txSig,
+        },
+      });
+      const replayBody = await replayRes.json();
+
+      appendLog({
+        title: `2b. Replay Same Receipt -> Rejected with HTTP ${replayRes.status}`,
+        tone: replayRes.status === 402 ? "ok" : "trip",
+        txSig: lastRedeemed.txSig,
+        detail: JSON.stringify(replayBody, null, 2),
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      appendLog({
+        title: "Replay Verification Error",
+        tone: "trip",
+        detail: msg,
+      });
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   // ACTION 3: Inject Drain Attack (Trips Circuit Breaker, 0 Moved)
   const handleInjectDrain = async () => {
     if (!agentKeypair || !vaultState || !activeSessionAddress) return;
     setBusyAction("drain");
     try {
-      const res402 = await fetch("/api/x402/resource", { cache: "no-store" });
+      const mintStr = vaultState.mint.toBase58();
+      const res402 = await fetch(
+        `/api/x402/resource?mint=${encodeURIComponent(mintStr)}`,
+        {
+          cache: "no-store",
+          headers: { "X-402-Mint": mintStr },
+        }
+      );
       const body402 = await res402.json();
       const challenge = body402.challenge;
       const requestHashBytes = hexToBytes(challenge.requestHashHex);
@@ -661,9 +829,9 @@ export default function JudgeSandbox() {
         cache: "no-store",
         headers: {
           "X-402-Vault": vaultState.address.toBase58(),
+          "X-402-Mint": mintStr,
           "X-402-Nonce": challenge.nonce,
           "X-402-Tx-Signature": txSig,
-          "X-402-Rpc-Url": rpcUrl,
         },
       });
       const verifyBody = await verifyAttempt.json();
@@ -699,7 +867,14 @@ export default function JudgeSandbox() {
     if (!agentKeypair || !vaultState || !activeSessionAddress) return;
     setBusyAction("salami");
     try {
-      const res402 = await fetch("/api/x402/resource", { cache: "no-store" });
+      const mintStr = vaultState.mint.toBase58();
+      const res402 = await fetch(
+        `/api/x402/resource?mint=${encodeURIComponent(mintStr)}`,
+        {
+          cache: "no-store",
+          headers: { "X-402-Mint": mintStr },
+        }
+      );
       const body402 = await res402.json();
       const requestHashBytes = hexToBytes(body402.challenge.requestHashHex);
       const [receiptPda] = deriveReceiptPda(vaultState.address, requestHashBytes);
@@ -725,7 +900,6 @@ export default function JudgeSandbox() {
         })
       );
 
-      // Send with skipPreflight=true so the hard revert lands on-chain with a verifiable Explorer signature
       await signAndConfirmBrowserTx(
         connection,
         salamiTx,
@@ -769,7 +943,6 @@ export default function JudgeSandbox() {
         "confirmed"
       );
 
-      // Executed by non-owner caller (Agent acting as permissionless third-party keeper)
       const reapTx = new Transaction().add(
         buildReapIdleSessionIx({
           caller: agentKeypair.publicKey,
@@ -899,7 +1072,7 @@ export default function JudgeSandbox() {
               disabled={!ownerKeypair || busyAction !== null}
               onClick={() => handleAirdrop("owner")}
             >
-              {busyAction === "airdrop-owner" ? "Requesting..." : "Airdrop 1 SOL"}
+              {busyAction === "airdrop-owner" ? "Funding..." : "Fund Owner SOL"}
             </button>
             <button
               id="btn-copy-owner"
@@ -925,16 +1098,16 @@ export default function JudgeSandbox() {
           </div>
           {faucetThrottled && (
             <div className="faucet-note">
-              Public RPC throttled airdrop. Copy the Owner pubkey above and paste
-              into{" "}
+              Server faucet unconfigured or public RPC throttled. Copy the Owner
+              pubkey above and request Devnet SOL at{" "}
               <a
                 href="https://faucet.solana.com"
                 target="_blank"
                 rel="noreferrer"
               >
                 faucet.solana.com
-              </a>{" "}
-              (Devnet). Step 1 automatically funds the Agent signer from Owner.
+              </a>
+              . Step 1 fits cleanly under 0.04 SOL (including Agent stipend).
             </div>
           )}
         </article>
@@ -955,7 +1128,7 @@ export default function JudgeSandbox() {
               disabled={!agentKeypair || busyAction !== null}
               onClick={() => handleAirdrop("agent")}
             >
-              {busyAction === "airdrop-agent" ? "Requesting..." : "Airdrop 1 SOL"}
+              {busyAction === "airdrop-agent" ? "Funding..." : "Fund Agent SOL"}
             </button>
             <button
               id="btn-copy-agent"
@@ -986,7 +1159,7 @@ export default function JudgeSandbox() {
         <div className="left-stack">
           <section className="panel" aria-labelledby="actions-heading">
             <div className="section-heading">
-              <h2 id="actions-heading">5-Step Devnet Verification Flow</h2>
+              <h2 id="actions-heading">Devnet Verification Actions</h2>
               <button
                 id="btn-refresh-state"
                 type="button"
@@ -1008,12 +1181,12 @@ export default function JudgeSandbox() {
                 <span className="action-title">
                   <span>1. Setup Demo Vault &amp; Session</span>
                   <span className="mono">
-                    {busyAction === "setup" ? "Running..." : "Init"}
+                    {busyAction === "setup" ? "Running..." : "< 0.04 SOL"}
                   </span>
                 </span>
                 <span className="action-desc">
-                  Creates MockUSDC mint, funds Vault (10 USDC), allowlists x402
-                  merchant, and opens a bounded Session (0.50 max/tx, 15s idle).
+                  Auto-funds via /api/faucet (with fallback), creates MockUSDC
+                  mint, funds Vault (10 USDC), and opens bounded Session.
                 </span>
               </button>
 
@@ -1034,8 +1207,27 @@ export default function JudgeSandbox() {
                   </span>
                 </span>
                 <span className="action-desc">
-                  Fetches HTTP 402 challenge, settles 0.25 USDC via Agent,
-                  initializes Receipt PDA, and unlocks HTTP 200 resource.
+                  Fetches mint-bound HTTP 402 challenge, settles 0.25 USDC, and
+                  verifies both Vault.mint and Receipt PDA on Devnet.
+                </span>
+              </button>
+
+              <button
+                id="btn-replay-receipt"
+                type="button"
+                className="action-button"
+                disabled={!lastRedeemed || busyAction !== null}
+                onClick={handleReplayReceipt}
+              >
+                <span className="action-title">
+                  <span>2b. Replay Same Receipt (Must Reject 402)</span>
+                  <span className="mono">
+                    {busyAction === "replay" ? "Testing..." : "Single-Use"}
+                  </span>
+                </span>
+                <span className="action-desc">
+                  Re-submits the exact headers from the last redeemed 200 OK
+                  Receipt to verify single-use HTTP 402 replay rejection.
                 </span>
               </button>
 
@@ -1166,6 +1358,20 @@ export default function JudgeSandbox() {
                 {vaultState ? `${formatUsdc(vaultUsdcBalance)} MockUSDC` : "—"}
               </div>
 
+              <div className="kv-key">Vault Mint</div>
+              <div className="kv-val mono">
+                {vaultState
+                  ? vaultState.mint.toBase58()
+                  : `Default Expected: ${DEVNET_USDC_MINT.toBase58()}`}
+              </div>
+
+              <div className="kv-key">Verified Mint</div>
+              <div className="kv-val mono">
+                {verifiedMint
+                  ? `${verifiedMint} (${verifiedMintMode ?? "verified"})`
+                  : "—"}
+              </div>
+
               <div className="kv-key">Vault Paused</div>
               <div className="kv-val mono">
                 {vaultState ? String(vaultState.paused) : "—"}
@@ -1251,9 +1457,9 @@ export default function JudgeSandbox() {
           <div className="console-body">
             {logs.length === 0 ? (
               <div className="log-empty mono">
-                Awaiting action. Fund the ephemeral Browser Owner wallet on
-                Solana Devnet, then run Steps 1–5 to inspect live Devnet
-                signatures and HTTP 402 -&gt; Receipt PDA verification payloads.
+                Awaiting action. Click Step 1 to auto-fund via /api/faucet (or
+                Devnet fallback) and initialize a live Vault &amp; Session, then
+                test Steps 2–5.
               </div>
             ) : (
               logs.map((entry) => (
