@@ -2,6 +2,10 @@
 
 Leash is a non-custodial Solana Anchor protocol that isolates autonomous agent hot keys (`x402` / `Pay.sh`) from treasury custody. A human or multisig **Vault Owner** deposits SPL liquidity into a PDA-controlled vault and issues bounded **Session** mandates to ephemeral **Agent Signers**. Any policy violation commits an irreversible on-chain circuit-breaker trip (`SessionStatus::Tripped`) while transferring **zero** tokens.
 
+- **Deployed Solana Devnet Program ID:** [`Gyka77keaTzBgPj12CrqEJFoZpZodjh1tzHeERAP9ZRH`](https://explorer.solana.com/address/Gyka77keaTzBgPj12CrqEJFoZpZodjh1tzHeERAP9ZRH?cluster=devnet)
+- **Devnet Deploy Transaction:** [`FzaMmyRUyrxWu7EP4Erzkj2yVpKXC1y1aKEywsEZACReDLU9r9ipd1T6MYa6Q55QYr8iMh2kMtC5XcRbLExtXoc`](https://explorer.solana.com/tx/FzaMmyRUyrxWu7EP4Erzkj2yVpKXC1y1aKEywsEZACReDLU9r9ipd1T6MYa6Q55QYr8iMh2kMtC5XcRbLExtXoc?cluster=devnet)
+- **On-Chain IDL Account:** [`F4kiQFPBNQ4EYHacVLVRB8g5AT54p7WdwiQtZWo1vuYG`](https://explorer.solana.com/address/F4kiQFPBNQ4EYHacVLVRB8g5AT54p7WdwiQtZWo1vuYG?cluster=devnet)
+
 ---
 
 ## 1. Threat Model
@@ -15,15 +19,13 @@ Autonomous agents executing HTTP `402 Payment Required` workflows hold hot signi
 | **Exfiltration to Rogue Merchant / Spoofed ATA** | Enforces owner-curated `allowlist` (max 16 unique pubkeys) AND verifies `merchant_ata.owner == merchant`, `merchant_ata.mint == vault.mint`, and `merchant_ata.delegate.is_none()`. |
 | **2x Boundary Burst Rate-Limit Bypass** | Continuous `u128` linear leaky-bucket refill eliminates fixed/tumbling window boundary resets. |
 | **Non-Reverting `x402` Settlement Spoofing** | Canonical `Receipt` PDA is allocated **only** on the passing settlement path; resource servers verify the `Receipt` PDA on-chain rather than `tx.meta.err == null`. |
+| **Pre-Funded / Dusted `Receipt` PDA DoS** | Uses `create_account` when `lamports == 0`, and falls back to `transfer` shortfall + `allocate` + `assign` signed by `Receipt` PDA seeds when pre-funded with dust lamports. |
 | **Vault Owner SOL Fee-Griefing & State Bloat** | `agent_signer` signs and pays tx fees + `Receipt` rent; expired `Receipt` and idle/tripped `Session` PDAs are permissionlessly reapable back to their original rent payers. |
 | **Global Emergency Incident** | `set_pause(true)` trips any active agent spend (`VaultPaused`) while `owner_withdraw` remains live at all times. |
 
 ---
 
 ## 2. Canonical PDA Architecture
-
-Program ID (pre-synced across `Anchor.toml`, `programs/leash/src/lib.rs`, and `app/`):  
-`Gyka77keaTzBgPj12CrqEJFoZpZodjh1tzHeERAP9ZRH`
 
 1. **`Vault`** — Seeds: `[b"vault", owner.key().as_ref()]` (`630` bytes)
    - Custody root owning the canonical SPL `vault_ata`. Stores `owner`, `mint`, `vault_ata`, `paused`, monotonic `session_nonce`, and deduplicated `allowlist` (`<= 16` merchants).
@@ -57,34 +59,30 @@ On Solana, if an instruction returns `Err(...)`, the runtime rolls back **all** 
 A naive `x402` resource server that only checks `tx.meta.err == null` would be tricked into serving paid data on a `0`-token circuit-breaker trip. Leash eliminates this trap:
 - `ExecuteAgentSpend` takes `receipt` as an `UncheckedAccount` verified against canonical seeds `[b"receipt", vault.key().as_ref(), &request_hash]`.
 - On any policy failure, `execute_agent_spend` returns `Ok(())` **without** creating or initializing the `Receipt` account.
-- Only when all 7 policy checks and SPL `transfer_checked` succeed does the program invoke `system_program::create_account` and serialize the `Receipt` discriminator + payload.
+- Only when all 7 policy checks and SPL `transfer_checked` succeed does the program allocate and serialize the `Receipt` discriminator + payload.
 - Resource servers (`/api/x402/resource`) verify the on-chain `Receipt` PDA directly (owner, discriminator, canonical bump, `vault`, `merchant`, `amount`, `request_hash`, and `clock.slot < expiry_slot`).
 
 ---
 
-## 5. Devnet Deployment Status & 1-Command Deploy
+## 5. Live Solana Devnet Verification Proof Links
 
-- **Current Status:** `PENDING_FUNDING` (public `api.devnet.solana.com` returned `HTTP 410` rate-limit on headless datacenter airdrop).
-- **Pre-Synced Program ID:** `Gyka77keaTzBgPj12CrqEJFoZpZodjh1tzHeERAP9ZRH` (`321,152` bytes; rent-exempt deploy minimum `1.6321024 SOL`).
-- **Deployer / Vault Owner Pubkey:** `2SLiJHDx9SmJn4TLKJuDAPoH1T2QLviD5giXTnmXoifB`
-- **Agent Signer Pubkey:** `GENRkS5amj5APxHyCrUEG6RpNq6esotQAhE31ipj8TSk`
+Full details and public keys are recorded in [`DEVNET_PROOF.md`](./DEVNET_PROOF.md):
 
-To deploy to Solana Devnet and automatically populate [`DEVNET_PROOF.md`](./DEVNET_PROOF.md) with live Solana Explorer proof links for all 4 adversarial scenarios (Normal Spend + Receipt, Drain Trip, Salami Hard-Revert, Permissionless Reap):
-
-1. Send **4 Devnet SOL** to `2SLiJHDx9SmJn4TLKJuDAPoH1T2QLviD5giXTnmXoifB` at [https://faucet.solana.com](https://faucet.solana.com).
-2. Run:
-   ```bash
-   ./scripts/deploy-devnet.sh
-   ```
-
-See [`DEVNET_PROOF.md`](./DEVNET_PROOF.md) for recorded public keys and verification table.
+| Verification Flow | On-Chain / HTTP Outcome | Solana Devnet Explorer Link |
+| :--- | :--- | :--- |
+| **(a) Normal Spend + Receipt Verification** | Settled `250,000` MockUSDC; created `Receipt` PDA (`2cSiWMAVNiNZyGSeXXcanqpvSF4SCSukY69araoSp4xh`) | [View Tx (`4SghwCco...`)](https://explorer.solana.com/tx/4SghwCcogY9QF4as2UJ9AVk6dm3MQEChPJSbTZNA491YydJDe8VNNQhWjmQk4XLvSDZueCpBxdiPTTV5iZ2MEG3Q?cluster=devnet) |
+| **(b) Prompt-Injection Drain Trip** | `Ok(())`, **0 tokens moved**, no `Receipt` PDA, `Tripped (ExceedsPerTxMax)` | [View Tx (`2BMpcD3V...`)](https://explorer.solana.com/tx/2BMpcD3V28hGN6PngMG3y5zKjQzHYLCUpVMgh7r9wvaLxzwfJPgTgtp3jjzs2dFwUTcsaQyBRWjNXMkrebPRBByg?cluster=devnet) |
+| **(c) Salami Retry Hard-Revert** | `100` unit retry hard-reverted on-chain (`Custom(6010) / SessionNotActive`) | [View Tx (`8kdt5Vr9...`)](https://explorer.solana.com/tx/8kdt5Vr9Rv5GR9HSNQT1pGutxHVVi7yoE6414Z3jm2WRM1oGiejDXeKVoqn3FmX4yzZxSkxnWEYXHaLyrcxZtZL?cluster=devnet) |
+| **(d) Permissionless Reap Session** | Third-party keeper closed `Session` PDA & returned full rent to `vault.owner` | [View Tx (`5ihDcDsr...`)](https://explorer.solana.com/tx/5ihDcDsrCvppfHVuVoxnQXi1Wzc3ktzSA4DsxAtWTW9hV49hZ7Eq1ypw9qi4Bmue1ccXX3mPncx23F3zcEW5YV1X?cluster=devnet) |
+| **(e) Live HTTP `x402` Tripped Bypass Rejected** | Non-reverting tripped tx (`meta.err == null`) rejected by `/api/x402/resource` with `HTTP 402` | [View Tx (`3pEuKA4v...`)](https://explorer.solana.com/tx/3pEuKA4vnhHR1r5puPk7oWby3nXJr2YysXwZas7eCC1foupy8qomi96mJ5UjwNnf8jgZshMXQEhHYt2sNdbKL7wV?cluster=devnet) |
+| **(f) Live HTTP `x402` Receipt Verified (`200 OK`)** | `/api/x402/resource` verified `Receipt` PDA (`3vN531QXPZwf9B4CzWajnJnD3S4P4qLgEpWpF28w4aF7`) -> `HTTP 200 OK` | [View Tx (`2SYVixyv...`)](https://explorer.solana.com/tx/2SYVixyvj4m4HarKHD6RgK2VU49aPGU1ZsbRhVXBD69wWSW8KKrw4EZHsgEH2tvvnnUqutCSbZ2Bz1L6vVDwsVgG?cluster=devnet) |
 
 ---
 
 ## 6. Local Run Instructions (3 Commands)
 
 ```bash
-# 1. Install root dependencies and run the 11-case localnet adversarial exploit suite
+# 1. Install root dependencies and run the 12-case localnet adversarial exploit suite
 npm install && anchor test
 
 # 2. Install and build the standalone Next.js Judge Sandbox + x402 Receipt verifier API

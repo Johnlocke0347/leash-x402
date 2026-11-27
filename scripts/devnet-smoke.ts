@@ -3,11 +3,11 @@ import { BN, Program } from "@anchor-lang/core";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
-  createAssociatedTokenAccount,
+  createAssociatedTokenAccountIdempotentInstruction,
   createMint,
   getAccount,
   getAssociatedTokenAddressSync,
-  mintTo,
+  createMintToInstruction,
 } from "@solana/spl-token";
 import {
   Connection,
@@ -16,7 +16,7 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
-  sendAndConfirmTransaction,
+  TransactionError,
 } from "@solana/web3.js";
 import { createHash } from "crypto";
 import * as fs from "fs";
@@ -77,12 +77,55 @@ function sha256Challenge(
   return Array.from(createHash("sha256").update(payload).digest());
 }
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise((r) => setTimeout(r, ms));
+}
+
+// Pure HTTP signature polling (avoids Devnet WebSocket 429 limits and returns on-chain err cleanly)
+async function sendAndPollConfirm(
+  connection: Connection,
+  tx: Transaction,
+  feePayer: Keypair,
+  extraSigners: Keypair[] = [],
+  opts: { skipPreflight?: boolean; allowOnChainErr?: boolean } = {}
+): Promise<{ sig: string; err: TransactionError | null }> {
+  tx.feePayer = feePayer.publicKey;
+  const latest = await connection.getLatestBlockhash("confirmed");
+  tx.recentBlockhash = latest.blockhash;
+  tx.sign(feePayer, ...extraSigners);
+
+  const sig = await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: opts.skipPreflight ?? false,
+    maxRetries: 5,
+  });
+
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    await sleep(1200);
+    const statuses = await connection.getSignatureStatuses([sig]);
+    const st = statuses.value[0];
+    if (
+      st &&
+      (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized")
+    ) {
+      if (st.err && !opts.allowOnChainErr) {
+        throw new Error(`Transaction ${sig} reverted: ${JSON.stringify(st.err)}`);
+      }
+      return { sig, err: st.err };
+    }
+  }
+
+  throw new Error(`Timed out confirming Devnet transaction ${sig}`);
+}
+
 async function main(): Promise<void> {
-  const connection = new Connection(DEVNET_RPC, "confirmed");
+  const connection = new Connection(DEVNET_RPC, {
+    commitment: "confirmed",
+    disableRetryOnRateLimit: false,
+  });
   const owner = loadKeypair(".devnet-keys/owner-devnet.json");
   const agent = loadKeypair(".devnet-keys/agent-devnet.json");
   const keeper = Keypair.generate();
-  const merchant = Keypair.generate();
 
   const idlPath = path.resolve(__dirname, "../target/idl/leash.json");
   const idl = JSON.parse(fs.readFileSync(idlPath, "utf-8"));
@@ -92,11 +135,17 @@ async function main(): Promise<void> {
   anchor.setProvider(provider);
   const program = new Program<Leash>(idl as Leash, provider);
 
-  console.log(`Program ID: ${program.programId.toBase58()}`);
-  console.log(`Owner:      ${owner.publicKey.toBase58()}`);
-  console.log(`Agent:      ${agent.publicKey.toBase58()}`);
+  const [x402MerchantPubkey] = PublicKey.findProgramAddressSync(
+    [Buffer.from("x402-merchant-v1")],
+    program.programId
+  );
 
-  // Ensure agent and throwaway keeper have SOL for tx fees & Receipt rent
+  console.log(`Program ID:    ${program.programId.toBase58()}`);
+  console.log(`Owner:         ${owner.publicKey.toBase58()}`);
+  console.log(`Agent:         ${agent.publicKey.toBase58()}`);
+  console.log(`x402 Merchant: ${x402MerchantPubkey.toBase58()}`);
+
+  // Fund throwaway keeper (and top up agent if needed)
   const agentBal = await connection.getBalance(agent.publicKey, "confirmed");
   const topUpTx = new Transaction();
   if (agentBal < 0.1 * LAMPORTS_PER_SOL) {
@@ -112,27 +161,19 @@ async function main(): Promise<void> {
     SystemProgram.transfer({
       fromPubkey: owner.publicKey,
       toPubkey: keeper.publicKey,
-      lamports: Math.floor(0.02 * LAMPORTS_PER_SOL),
+      lamports: Math.floor(0.015 * LAMPORTS_PER_SOL),
     })
   );
-  await sendAndConfirmTransaction(connection, topUpTx, [owner], { commitment: "confirmed" });
+  await sendAndPollConfirm(connection, topUpTx, owner);
 
-  // Create MockUSDC Mint & ATAs
-  const mockUsdc = await createMint(connection, owner, owner.publicKey, null, 6);
   const [vaultPda] = deriveVaultPda(owner.publicKey, program.programId);
-  const vaultAta = getAssociatedTokenAddressSync(mockUsdc, vaultPda, true);
-  const merchantAta = await createAssociatedTokenAccount(
-    connection,
-    owner,
-    mockUsdc,
-    merchant.publicKey
-  );
-
-  // Initialize or update Vault
   const existingVault = await connection.getAccountInfo(vaultPda, "confirmed");
+
   if (!existingVault) {
-    await program.methods
-      .initVault(mockUsdc, [merchant.publicKey])
+    const mockUsdc = await createMint(connection, owner, owner.publicKey, null, 6);
+    const vaultAta = getAssociatedTokenAddressSync(mockUsdc, vaultPda, true);
+    const initTx = await program.methods
+      .initVault(mockUsdc, [x402MerchantPubkey])
       .accountsPartial({
         owner: owner.publicKey,
         vault: vaultPda,
@@ -142,38 +183,53 @@ async function main(): Promise<void> {
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
-      .signers([owner])
-      .rpc();
+      .transaction();
+    await sendAndPollConfirm(connection, initTx, owner);
   }
 
   const activeVault = await program.account.vault.fetch(vaultPda);
   const activeMint = activeVault.mint;
   const activeVaultAta = activeVault.vaultAta;
-  const activeMerchantAta = activeMint.equals(mockUsdc)
-    ? merchantAta
-    : await createAssociatedTokenAccount(connection, owner, activeMint, merchant.publicKey);
+  const activeMerchantAta = getAssociatedTokenAddressSync(
+    activeMint,
+    x402MerchantPubkey,
+    true
+  );
 
-  if (!activeVault.allowlist.some((k) => k.equals(merchant.publicKey))) {
-    await program.methods
-      .updateAllowlist([merchant.publicKey])
-      .accountsPartial({ owner: owner.publicKey, vault: vaultPda })
-      .signers([owner])
-      .rpc();
+  // Ensure canonical x402 merchant ATA, allowlist, unpaused vault, and MockUSDC liquidity
+  const prepTx = new Transaction().add(
+    createAssociatedTokenAccountIdempotentInstruction(
+      owner.publicKey,
+      activeMerchantAta,
+      x402MerchantPubkey,
+      activeMint
+    )
+  );
+  if (!activeVault.allowlist.some((k) => k.equals(x402MerchantPubkey))) {
+    prepTx.add(
+      await program.methods
+        .updateAllowlist([x402MerchantPubkey])
+        .accountsPartial({ owner: owner.publicKey, vault: vaultPda })
+        .instruction()
+    );
   }
   if (activeVault.paused) {
-    await program.methods
-      .setPause(false)
-      .accountsPartial({ owner: owner.publicKey, vault: vaultPda })
-      .signers([owner])
-      .rpc();
+    prepTx.add(
+      await program.methods
+        .setPause(false)
+        .accountsPartial({ owner: owner.publicKey, vault: vaultPda })
+        .instruction()
+    );
   }
-
-  await mintTo(connection, owner, activeMint, activeVaultAta, owner, 10_000_000);
+  prepTx.add(
+    createMintToInstruction(activeMint, activeVaultAta, owner.publicKey, 10_000_000)
+  );
+  await sendAndPollConfirm(connection, prepTx, owner);
 
   // Create fresh Session
   const vaultFresh = await program.account.vault.fetch(vaultPda);
   const [sessionPda] = deriveSessionPda(vaultPda, vaultFresh.sessionNonce, program.programId);
-  await program.methods
+  const createSessionTx = await program.methods
     .createSession(
       agent.publicKey,
       new BN(500_000), // 0.50 MockUSDC max_per_tx
@@ -188,14 +244,14 @@ async function main(): Promise<void> {
       session: sessionPda,
       systemProgram: SystemProgram.programId,
     })
-    .signers([owner])
-    .rpc();
+    .transaction();
+  await sendAndPollConfirm(connection, createSessionTx, owner);
 
   // (a) Normal Spend + Receipt Verification
   const normalHash = sha256Challenge(
     "GET",
     "/api/x402/resource",
-    merchant.publicKey,
+    x402MerchantPubkey,
     250_000,
     `devnet-normal-${Date.now()}`
   );
@@ -208,18 +264,14 @@ async function main(): Promise<void> {
       session: sessionPda,
       mint: activeMint,
       vaultAta: activeVaultAta,
-      merchant: merchant.publicKey,
+      merchant: x402MerchantPubkey,
       merchantAta: activeMerchantAta,
       receipt: normalReceiptPda,
       tokenProgram: TOKEN_PROGRAM_ID,
       systemProgram: SystemProgram.programId,
     })
     .transaction();
-  normalTx.feePayer = agent.publicKey;
-  normalTx.recentBlockhash = (await connection.getLatestBlockhash("confirmed")).blockhash;
-  const normalSig = await sendAndConfirmTransaction(connection, normalTx, [agent], {
-    commitment: "confirmed",
-  });
+  const { sig: normalSig } = await sendAndPollConfirm(connection, normalTx, agent);
 
   const receiptState = await program.account.receipt.fetch(normalReceiptPda);
   if (receiptState.amount.toNumber() !== 250_000) {
@@ -232,7 +284,7 @@ async function main(): Promise<void> {
   const drainHash = sha256Challenge(
     "POST",
     "/api/x402/drain",
-    merchant.publicKey,
+    x402MerchantPubkey,
     5_000_000,
     `devnet-drain-${Date.now()}`
   );
@@ -245,18 +297,14 @@ async function main(): Promise<void> {
       session: sessionPda,
       mint: activeMint,
       vaultAta: activeVaultAta,
-      merchant: merchant.publicKey,
+      merchant: x402MerchantPubkey,
       merchantAta: activeMerchantAta,
       receipt: drainReceiptPda,
       tokenProgram: TOKEN_PROGRAM_ID,
       systemProgram: SystemProgram.programId,
     })
     .transaction();
-  drainTx.feePayer = agent.publicKey;
-  drainTx.recentBlockhash = (await connection.getLatestBlockhash("confirmed")).blockhash;
-  const drainSig = await sendAndConfirmTransaction(connection, drainTx, [agent], {
-    commitment: "confirmed",
-  });
+  const { sig: drainSig } = await sendAndPollConfirm(connection, drainTx, agent);
 
   const vaultAfterDrain = (await getAccount(connection, activeVaultAta)).amount;
   const drainReceiptInfo = await connection.getAccountInfo(drainReceiptPda, "confirmed");
@@ -273,7 +321,7 @@ async function main(): Promise<void> {
   const salamiHash = sha256Challenge(
     "GET",
     "/api/x402/resource",
-    merchant.publicKey,
+    x402MerchantPubkey,
     100,
     `devnet-salami-${Date.now()}`
   );
@@ -286,28 +334,26 @@ async function main(): Promise<void> {
       session: sessionPda,
       mint: activeMint,
       vaultAta: activeVaultAta,
-      merchant: merchant.publicKey,
+      merchant: x402MerchantPubkey,
       merchantAta: activeMerchantAta,
       receipt: salamiReceiptPda,
       tokenProgram: TOKEN_PROGRAM_ID,
       systemProgram: SystemProgram.programId,
     })
     .transaction();
-  salamiTx.feePayer = agent.publicKey;
-  const salamiBh = await connection.getLatestBlockhash("confirmed");
-  salamiTx.recentBlockhash = salamiBh.blockhash;
-  salamiTx.sign(agent);
-  const salamiSig = await connection.sendRawTransaction(salamiTx.serialize(), {
-    skipPreflight: true,
-  });
-  const salamiConf = await connection.confirmTransaction(
-    { signature: salamiSig, ...salamiBh },
-    "confirmed"
+  const { sig: salamiSig, err: salamiErr } = await sendAndPollConfirm(
+    connection,
+    salamiTx,
+    agent,
+    [],
+    { skipPreflight: true, allowOnChainErr: true }
   );
-  if (!salamiConf.value.err) {
+  if (!salamiErr) {
     throw new Error("Expected Salami retry to hard-revert with SessionNotActive");
   }
-  console.log(`(c) Salami Hard-Revert (on-chain err=${JSON.stringify(salamiConf.value.err)}): ${explorerTx(salamiSig)}`);
+  console.log(
+    `(c) Salami Hard-Revert (on-chain err=${JSON.stringify(salamiErr)}): ${explorerTx(salamiSig)}`
+  );
 
   // (d) Permissionless Reap Idle / Tripped Session -> full rent returned to owner
   const reapTx = await program.methods
@@ -319,11 +365,7 @@ async function main(): Promise<void> {
       rentRecipient: owner.publicKey,
     })
     .transaction();
-  reapTx.feePayer = keeper.publicKey;
-  reapTx.recentBlockhash = (await connection.getLatestBlockhash("confirmed")).blockhash;
-  const reapSig = await sendAndConfirmTransaction(connection, reapTx, [keeper], {
-    commitment: "confirmed",
-  });
+  const { sig: reapSig } = await sendAndPollConfirm(connection, reapTx, keeper);
   console.log(`(d) Permissionless Reap Session: ${explorerTx(reapSig)}`);
 
   const proofMarkdown = `# Devnet Deployment & Verification Proof (\`DEVNET_PROOF.md\`)
@@ -341,6 +383,7 @@ async function main(): Promise<void> {
 | **Owner + Deployer** | \`.devnet-keys/owner-devnet.json\` | \`${owner.publicKey.toBase58()}\` |
 | **Agent Signer** | \`.devnet-keys/agent-devnet.json\` | \`${agent.publicKey.toBase58()}\` |
 | **Vault PDA** | Derived \`["vault", owner]\` | \`${vaultPda.toBase58()}\` |
+| **Canonical x402 Merchant** | Derived \`["x402-merchant-v1"]\` | \`${x402MerchantPubkey.toBase58()}\` |
 | **MockUSDC Mint** | SPL Token Mint (6 decimals) | \`${activeMint.toBase58()}\` |
 
 ---
@@ -349,10 +392,10 @@ async function main(): Promise<void> {
 
 | Scenario | Verified On-Chain Outcome | Devnet Explorer Link |
 | :--- | :--- | :--- |
-| **(a) Normal Spend + Receipt Verification** | Transferred \`250,000\` MockUSDC; verified canonical \`Receipt\` PDA (\`${normalReceiptPda.toBase58()}\`) | [\`${normalSig.slice(0, 16)}...\`](${explorerTx(normalSig)}) |
-| **(b) Prompt-Injection Drain Trip** | Returned \`Ok(())\`, **0 tokens moved**, no \`Receipt\` PDA, \`status = Tripped (ExceedsPerTxMax)\` | [\`${drainSig.slice(0, 16)}...\`](${explorerTx(drainSig)}) |
-| **(c) Salami Retry Hard-Revert** | \`100\` unit follow-up spend hard-reverted on-chain (\`SessionNotActive\`) | [\`${salamiSig.slice(0, 16)}...\`](${explorerTx(salamiSig)}) |
-| **(d) Permissionless Reap Session** | Third-party keeper (\`${keeper.publicKey.toBase58()}\`) closed \`Session\` PDA & returned full rent to \`owner\` | [\`${reapSig.slice(0, 16)}...\`](${explorerTx(reapSig)}) |
+| **(a) Normal Spend + Receipt Verification** | Transferred \`250,000\` MockUSDC; verified canonical \`Receipt\` PDA (\`${normalReceiptPda.toBase58()}\`) | [${explorerTx(normalSig)}](${explorerTx(normalSig)}) |
+| **(b) Prompt-Injection Drain Trip** | Returned \`Ok(())\`, **0 tokens moved**, no \`Receipt\` PDA, \`status = Tripped (ExceedsPerTxMax)\` | [${explorerTx(drainSig)}](${explorerTx(drainSig)}) |
+| **(c) Salami Retry Hard-Revert** | \`100\` unit follow-up spend hard-reverted on-chain (\`Custom(6010) / SessionNotActive\`) | [${explorerTx(salamiSig)}](${explorerTx(salamiSig)}) |
+| **(d) Permissionless Reap Idle / Tripped Session** | Third-party keeper (\`${keeper.publicKey.toBase58()}\`) closed \`Session\` PDA & returned full rent to \`owner\` | [${explorerTx(reapSig)}](${explorerTx(reapSig)}) |
 `;
 
   fs.writeFileSync(path.resolve(__dirname, "../DEVNET_PROOF.md"), proofMarkdown, "utf-8");

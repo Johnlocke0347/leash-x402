@@ -534,6 +534,7 @@ pub struct ExecuteAgentSpend<'info> {
         mut,
         seeds = [b"session", session.vault.as_ref(), &session.nonce.to_le_bytes()],
         bump = session.bump,
+        constraint = session.vault == vault.key() @ VaultError::VaultMismatch,
     )]
     pub session: Account<'info, Session>,
 
@@ -646,6 +647,7 @@ pub struct OwnerWithdraw<'info> {
     #[account(
         mut,
         address = vault.vault_ata @ VaultError::InvalidVaultAta,
+        constraint = vault_ata.owner == vault.key() && vault_ata.mint == vault.mint @ VaultError::InvalidVaultAta,
     )]
     pub vault_ata: Account<'info, TokenAccount>,
 

@@ -100,25 +100,31 @@ async function signAndConfirmBrowserTx(
 
   const sig = await connection.sendRawTransaction(tx.serialize(), {
     skipPreflight,
+    maxRetries: 5,
   });
-  const conf = await connection.confirmTransaction(
-    {
-      signature: sig,
-      blockhash: latest.blockhash,
-      lastValidBlockHeight: latest.lastValidBlockHeight,
-    },
-    "confirmed"
-  );
 
-  if (conf.value.err) {
-    const err = new Error(
-      `On-chain revert: ${JSON.stringify(conf.value.err)}`
-    ) as Error & { txSig?: string };
-    err.txSig = sig;
-    throw err;
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 1200));
+    const statuses = await connection.getSignatureStatuses([sig]);
+    const st = statuses.value[0];
+    if (
+      st &&
+      (st.confirmationStatus === "confirmed" ||
+        st.confirmationStatus === "finalized")
+    ) {
+      if (st.err) {
+        const err = new Error(
+          `On-chain revert: ${JSON.stringify(st.err)}`
+        ) as Error & { txSig?: string };
+        err.txSig = sig;
+        throw err;
+      }
+      return sig;
+    }
   }
 
-  return sig;
+  throw new Error(`Timed out confirming Devnet transaction ${sig}`);
 }
 
 export default function JudgeSandbox() {

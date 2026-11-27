@@ -17,6 +17,7 @@ import {
   PublicKey,
   SYSVAR_CLOCK_PUBKEY,
   SystemProgram,
+  Transaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import { expect } from "chai";
@@ -1213,4 +1214,127 @@ describe("leash — Adversarial Security & Circuit-Breaker Suite", () => {
       merchant1.publicKey.toBase58(),
     ]);
   });
+
+  it("12. Pre-funded Receipt PDA DoS defense: standalone pre-funded & 1-lamport intra-tx dusted Receipt PDAs settle cleanly while replay reverts with ReceiptAlreadyExists", async () => {
+    const sessionPda = await createStandardSession();
+
+    // 12a: Standalone prior-tx pre-funding (0-byte rent-exempt minimum = 890,880 lamports)
+    const spendAmount = 225_000;
+    const dustedHash = buildX402RequestHash(
+      "GET",
+      "/api/x402/resource",
+      merchant1.publicKey,
+      spendAmount,
+      "dusted-receipt-dos-standalone"
+    );
+    const [dustedReceiptPda] = deriveReceiptPda(vaultPda, dustedHash, program.programId);
+
+    const zeroByteRent = await connection.getMinimumBalanceForRentExemption(0);
+    const dustTx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: attacker.publicKey,
+        toPubkey: dustedReceiptPda,
+        lamports: zeroByteRent,
+      })
+    );
+    dustTx.feePayer = attacker.publicKey;
+    dustTx.recentBlockhash = (await connection.getLatestBlockhash("confirmed")).blockhash;
+    await sendAndConfirmTransaction(connection, dustTx, [attacker], {
+      commitment: "confirmed",
+    });
+
+    const preDustInfo = await connection.getAccountInfo(dustedReceiptPda, "confirmed");
+    expect(preDustInfo).to.not.be.null;
+    expect(preDustInfo!.lamports).to.equal(zeroByteRent);
+    expect(preDustInfo!.data.length).to.equal(0);
+    expect(preDustInfo!.owner.toBase58()).to.equal(SystemProgram.programId.toBase58());
+
+    const vaultBefore = (await getAccount(connection, vaultAta)).amount;
+    const merchantBefore = (await getAccount(connection, merchant1Ata)).amount;
+
+    await executeSpendWithFeePayer({
+      signer: agent,
+      session: sessionPda,
+      merchant: merchant1.publicKey,
+      merchantAta: merchant1Ata,
+      amount: spendAmount,
+      requestHash: dustedHash,
+      receiptTtlSlots: 20,
+    });
+
+    const vaultAfter = (await getAccount(connection, vaultAta)).amount;
+    const merchantAfter = (await getAccount(connection, merchant1Ata)).amount;
+    expect(vaultBefore - vaultAfter).to.equal(BigInt(spendAmount));
+    expect(merchantAfter - merchantBefore).to.equal(BigInt(spendAmount));
+
+    const receipt = await program.account.receipt.fetch(dustedReceiptPda);
+    expect(receipt.vault.toBase58()).to.equal(vaultPda.toBase58());
+    expect(receipt.amount.toNumber()).to.equal(spendAmount);
+    expect(receipt.rentPayer.toBase58()).to.equal(agent.publicKey.toBase58());
+
+    // 12b: Intra-transaction 1-lamport dusted Receipt PDA right before execute_agent_spend
+    const oneLamportHash = buildX402RequestHash(
+      "GET",
+      "/api/x402/resource",
+      merchant1.publicKey,
+      125_000,
+      "dusted-receipt-1-lamport-intratx"
+    );
+    const [oneLamportReceiptPda] = deriveReceiptPda(
+      vaultPda,
+      oneLamportHash,
+      program.programId
+    );
+    const spendIx = await program.methods
+      .executeAgentSpend(new BN(125_000), oneLamportHash, new BN(20))
+      .accountsPartial({
+        agentSigner: agent.publicKey,
+        vault: vaultPda,
+        session: sessionPda,
+        mint: usdcMint,
+        vaultAta,
+        merchant: merchant1.publicKey,
+        merchantAta: merchant1Ata,
+        receipt: oneLamportReceiptPda,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+
+    const intraDustTx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: agent.publicKey,
+        toPubkey: oneLamportReceiptPda,
+        lamports: 1,
+      }),
+      spendIx
+    );
+    intraDustTx.feePayer = agent.publicKey;
+    intraDustTx.recentBlockhash = (await connection.getLatestBlockhash("confirmed")).blockhash;
+    await sendAndConfirmTransaction(connection, intraDustTx, [agent], {
+      commitment: "confirmed",
+    });
+
+    const oneLamportReceipt = await program.account.receipt.fetch(oneLamportReceiptPda);
+    expect(oneLamportReceipt.amount.toNumber()).to.equal(125_000);
+    expect(Array.from(oneLamportReceipt.requestHash)).to.deep.equal(oneLamportHash);
+
+    // 12c: Already-initialized Receipt PDA still hard-reverts with ReceiptAlreadyExists
+    await expectAnchorRevert(
+      executeSpendWithFeePayer({
+        signer: agent,
+        session: sessionPda,
+        merchant: merchant1.publicKey,
+        merchantAta: merchant1Ata,
+        amount: spendAmount,
+        requestHash: dustedHash,
+        receiptTtlSlots: 20,
+      }),
+      "ReceiptAlreadyExists"
+    );
+
+    const sessionAfter = await program.account.session.fetch(sessionPda);
+    expect(sessionAfter.status).to.deep.equal({ active: {} });
+  });
 });
+

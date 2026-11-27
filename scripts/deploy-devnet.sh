@@ -46,7 +46,7 @@ anchor deploy --provider.cluster devnet --provider.wallet "$OWNER_KEY"
 echo "Transferring 0.5 SOL from owner to agent if needed and running Devnet smoke suite..."
 AGENT_SOL=$(solana balance "$AGENT_PUB" --url devnet | awk '{print $1}')
 if awk "BEGIN {exit !($AGENT_SOL < 0.2)}"; then
-  solana transfer "$AGENT_PUB" 0.5 --from "$OWNER_KEY" --url devnet --allow-unfunded-recipient
+  solana transfer "$AGENT_PUB" 0.5 --keypair "$OWNER_KEY" --from "$OWNER_KEY" --url devnet --allow-unfunded-recipient
 fi
 
 npm run devnet:smoke
