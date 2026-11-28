@@ -917,13 +917,18 @@ export default function JudgeSandbox() {
         markStepDone(3);
       }
 
+      const isUpstash = replayBody.replayStore === "upstash_redis";
       appendTrace({
-        title: "Step 3 · Single-Use Receipt Replay Blocked",
+        title: isUpstash
+          ? "Step 3 · Single-Use Receipt Replay Blocked (Upstash Atomic)"
+          : "Step 3 · Single-Use Receipt Replay Blocked",
         badgeLabel: `HTTP ${replayRes.status} REJECTED`,
         tone: replayRes.status === 402 ? "ok" : "trip",
         deltaSummary: "0.00 USDC (No new tx)",
         mintSummary: shortKey(lastRedeemed.mint),
-        receiptSummary: `${shortKey(lastRedeemed.receiptPda)} Already Redeemed`,
+        receiptSummary: `${shortKey(lastRedeemed.receiptPda)} · ${
+          isUpstash ? "Upstash Atomic Lock" : "Already Redeemed"
+        }`,
         txSig: lastRedeemed.txSig,
         rawJson: JSON.stringify(replayBody, null, 2),
       });
@@ -1316,7 +1321,13 @@ export default function JudgeSandbox() {
           </span>
 
           <span className="status-pill mono" id="pill-replay-store">
-            <span className="dot dot-cyan" />
+            <span
+              className={`dot ${
+                serverStatus?.replayStore === "upstash_redis"
+                  ? "dot-ok"
+                  : "dot-cyan"
+              }`}
+            />
             Replay:{" "}
             {serverStatus?.replayStore === "upstash_redis"
               ? "Upstash Atomic"
@@ -1324,13 +1335,7 @@ export default function JudgeSandbox() {
           </span>
 
           <span className="status-pill mono" id="pill-mint-policy">
-            <span
-              className={`dot ${
-                serverStatus?.mintPolicy.mode === "strict_usdc"
-                  ? "dot-ok"
-                  : "dot-warn"
-              }`}
-            />
+            <span className={`dot ${serverStatus ? "dot-ok" : "dot-warn"}`} />
             {serverStatus?.mintPolicy.mode === "strict_usdc"
               ? "Strict Devnet USDC"
               : "Sandbox MockUSDC"}

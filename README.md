@@ -12,16 +12,19 @@
 
 ## Live Judge Security Console (`app/`)
 
-All three screenshots below were captured in headless Chromium (`1440×900`) executing live transactions against Solana Devnet (`Gyka77keaTzBgPj12CrqEJFoZpZodjh1tzHeERAP9ZRH`):
+All four screenshots below were captured automatically by [`scripts/verify-vercel-live.py`](./scripts/verify-vercel-live.py) in headless Chromium (`1440×900`) executing live transactions against Solana Devnet (`Gyka77keaTzBgPj12CrqEJFoZpZodjh1tzHeERAP9ZRH`):
 
-### 1. Normal `x402` Settlement (`HTTP 402` -> On-Chain `Vault` + `Receipt` Verified -> `HTTP 200 OK`) & Replay Rejection
-![Judge Sandbox Settled 200 OK & Replay Rejected](./docs/screenshots/01-sandbox-settled-200.png)
+### 1. Why Naive `tx.meta.err == null` Fails & How Leash Closes the Non-Reverting `x402` Trap
+![Protocol Architecture Diagram](./docs/screenshots/01-architecture-diagram.png)
 
-### 2. Prompt-Injection Drain Soft-Trip (`0` Tokens Moved) & Salami Retry Hard-Revert (`Custom(6010)`)
-![Prompt-Injection Circuit Breaker Tripped](./docs/screenshots/02-circuit-breaker-tripped.png)
+### 2. Normal `x402` Settlement (`HTTP 200 OK`) & Atomic Upstash Single-Use Replay Rejection (`HTTP 402`)
+![Settled 200 OK & Atomic Upstash Replay Rejected](./docs/screenshots/02-live-settled-and-replay.png)
 
-### 3. Permissionless Session Reap (Rent Returned to `vault.owner`) & Protocol Architecture
-![Permissionless Reap & Protocol Architecture](./docs/screenshots/03-architecture-and-reap.png)
+### 3. Prompt-Injection Drain Soft-Trip (`0` Tokens Moved) & Salami Retry Hard-Revert (`Custom(6010)`)
+![Prompt-Injection Circuit Breaker Tripped](./docs/screenshots/03-circuit-breaker-tripped.png)
+
+### 4. Permissionless Session Reap (`REAPED (RENT RETURNED)` & Rent Restored to `vault.owner`)
+![Permissionless Session Reap & Trace](./docs/screenshots/04-session-reaped.png)
 
 ---
 
@@ -80,8 +83,8 @@ Over any arbitrary interval $\Delta t$, total outflow is strictly upper-bounded 
    - `/api/x402/resource` computes `request_hash = sha256("${method}|${path}|${merchant}|${mint}|${amount}|${nonce}")` and fetches **both** the canonical `Receipt` PDA (`[b"receipt", vault, request_hash]`) and `Vault` PDA (`receipt.vault`) from Solana Devnet, verifying ownership by `Gyka77keaTzBgPj12CrqEJFoZpZodjh1tzHeERAP9ZRH`, canonical PDA bumps, `vault.mint == expectedMint`, `receipt.merchant`, `receipt.amount`, `receipt.requestHash`, and `currentSlot < receipt.expirySlot`.
 3. **Atomic Serverless Replay & Faucet Cooldown Store (`app/src/lib/kv-store.ts`):**
    - Uses zero-dependency native `fetch` against Upstash Redis REST (`UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`, with automatic fallback to `KV_REST_API_URL` + `KV_REST_API_TOKEN` for Vercel Marketplace KV/Upstash integrations).
-   - Executes atomic `["SET", key, "1", "EX", ttlSeconds, "NX"]` for single-use `x402` receipt redemption and `POST /api/faucet` 5-minute per-IP + per-pubkey rate limits so protection survives Vercel cold starts and multi-instance concurrency.
-   - Falls back cleanly to a TTL-pruned in-memory `Map` during local zero-config development and reports the active mode (`"upstash_redis"` vs `"in_memory_fallback"`) via `GET /api/status`.
+   - Executes fail-closed atomic `["SET", key, "1", "EX", ttlSeconds, "NX"]` for single-use `x402` receipt redemption (returning `HTTP 503` if Redis is unreachable rather than risking a replay), plus a 5-minute per-pubkey lock and an Upstash `/pipeline` (`INCR` + `EXPIRE`) counter allowing **5 drips per 10 minutes per IP** so shared-NAT judges never hit false `429` lockouts.
+   - Falls back cleanly to TTL-pruned in-memory stores during local zero-config development and reports the active mode (`"upstash_redis"` vs `"in_memory_fallback"`) via `GET /api/status`.
 
 ---
 
@@ -110,17 +113,20 @@ Full transaction logs and public keys are recorded in [`DEVNET_PROOF.md`](./DEVN
    - `SOLANA_RPC_URL` — Server-side Devnet RPC URL used by `/api/x402/resource`, `/api/faucet`, and `/api/status`.
    - `ALLOW_SANDBOX_MOCK_MINT` — Set to `"true"` on Judge Sandbox deployments to allow per-session MockUSDC vaults, or `"false"` in production to strictly enforce `EXPECTED_MINT`.
    - `EXPECTED_MINT` — Enforced SPL mint in strict mode (defaults to Devnet USDC `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU`).
-   - `FAUCET_SECRET_KEY` *(optional, server-only — never `NEXT_PUBLIC_`)* — JSON 64-byte array or base58 secret key of a funded Devnet SOL wallet to auto-drip `0.05 SOL` in Step 1 (`~0.0278 SOL` peak setup + `0.015 SOL` Agent stipend, and only `0.0095 SOL` net rent + fees consumed across all 6 steps after Session reap, leaving `0.0405 SOL` across the browser wallets). When unset, `/api/faucet` returns `HTTP 503` and the UI degrades cleanly to `requestAirdrop` + `https://faucet.solana.com`.
-   - `UPSTASH_REDIS_REST_URL` & `UPSTASH_REDIS_REST_TOKEN` *(optional locally)* — Atomic Redis store for receipt replay protection and 5-minute faucet cooldowns.
-4. Verify live deployment health at `GET /api/status` (returns safe public diagnostics with zero secrets: `programId`, `cluster`, `rpcMode`, `faucet`, `replayStore`, `mintPolicy`).
+   - `FAUCET_SECRET_KEY` *(optional, server-only — never `NEXT_PUBLIC_`)* — JSON 64-byte array (raw, multiline, or quoted) or base58 secret key of a funded Devnet SOL wallet (`>= 0.06 SOL` safety reserve) to auto-drip `0.05 SOL` in Step 1 (`~0.0278 SOL` peak setup + `0.015 SOL` Agent stipend, and only `0.0095 SOL` net rent + fees consumed across all 6 steps after Session reap). When unset or `< 0.06 SOL`, `/api/faucet` returns `HTTP 503` and the UI degrades cleanly to `requestAirdrop` + `https://faucet.solana.com`.
+   - `UPSTASH_REDIS_REST_URL` & `UPSTASH_REDIS_REST_TOKEN` *(optional locally)* — Atomic Redis store for receipt replay protection and faucet rate limits (`1` drip / `5m` per pubkey, `5` drips / `10m` per IP).
+4. Run the 1-command live Vercel verifier + screenshotter against your deployed URL:
+   ```bash
+   python3 scripts/verify-vercel-live.py --url https://your-app.vercel.app --strict-green
+   ```
 
 ---
 
-## 7. Local Run Instructions (3 Commands)
+## 7. Local Run & Verification Instructions
 
 ```bash
-# 1. Install root dependencies and run the 12-case localnet adversarial exploit suite
-npm install && anchor test
+# 1. Run the 12-case localnet Anchor exploit suite & serverless Upstash/faucet unit tests
+npm install && anchor test && npx ts-node -P ./tsconfig.json scripts/test-serverless-units.ts
 
 # 2. Install and build the standalone Next.js Judge Sandbox + x402 Receipt verifier API
 npm install --prefix app && npm run build --prefix app

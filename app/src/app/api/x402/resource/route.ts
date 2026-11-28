@@ -2,9 +2,9 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import { createHash, randomBytes } from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 import {
-  claimAtomicKey,
   getAtomicStoreMode,
   peekKeyTtlSeconds,
+  redeemReceiptAtomically,
 } from "@/lib/kv-store";
 import {
   DEFAULT_DEVNET_RPC,
@@ -23,6 +23,7 @@ import {
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+export const maxDuration = 60;
 
 const RESOURCE_PATH = "/api/x402/resource";
 const REDEEMED_RECEIPT_TTL_SECONDS = 30 * 60; // 30 minutes (> 300-slot Receipt TTL)
@@ -189,14 +190,27 @@ export async function GET(request: NextRequest) {
   const replayKey = `leash:x402:receipt:${hashHex}`;
 
   // Pre-RPC fast check: reject already-redeemed Receipt without burning RPC calls
-  const alreadyRedeemed = await peekKeyTtlSeconds(replayKey);
-  if (alreadyRedeemed.exists) {
-    return paymentRequiredResponse({
-      mint: expectedMint,
-      mintVerificationMode,
-      nonce: randomBytes(12).toString("hex"),
-      reason: "Receipt already redeemed — single-use x402 settlement enforced.",
-    });
+  try {
+    const alreadyRedeemed = await peekKeyTtlSeconds(replayKey);
+    if (alreadyRedeemed.exists) {
+      return paymentRequiredResponse({
+        mint: expectedMint,
+        mintVerificationMode,
+        nonce: randomBytes(12).toString("hex"),
+        reason:
+          "Receipt already redeemed — single-use x402 settlement enforced.",
+      });
+    }
+  } catch (kvErr: unknown) {
+    return NextResponse.json(
+      {
+        status: 503,
+        verified: false,
+        error: "Replay Protection Store Unavailable (Failing Closed)",
+        detail: kvErr instanceof Error ? kvErr.message : String(kvErr),
+      },
+      { status: 503, headers: { "Cache-Control": "no-store" } }
+    );
   }
 
   const [expectedReceiptPda, expectedBump] = deriveReceiptPda(
@@ -344,15 +358,29 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // Atomic serverless SET key "1" EX ttl NX claim across concurrent instances
-    const claim = await claimAtomicKey(replayKey, REDEEMED_RECEIPT_TTL_SECONDS);
-    if (!claim.acquired) {
-      return paymentRequiredResponse({
-        mint: expectedMint,
-        mintVerificationMode,
-        nonce: randomBytes(12).toString("hex"),
-        reason: "Receipt already redeemed — single-use x402 settlement enforced.",
-      });
+    // Atomic serverless SET key "1" EX ttl NX claim across concurrent instances (fails closed on Redis error)
+    const redemption = await redeemReceiptAtomically(
+      replayKey,
+      REDEEMED_RECEIPT_TTL_SECONDS
+    );
+    if (!redemption.ok) {
+      if (redemption.reason === "already_redeemed") {
+        return paymentRequiredResponse({
+          mint: expectedMint,
+          mintVerificationMode,
+          nonce: randomBytes(12).toString("hex"),
+          reason: redemption.error,
+        });
+      }
+      return NextResponse.json(
+        {
+          status: 503,
+          verified: false,
+          error: "Replay Protection Store Unavailable (Failing Closed)",
+          detail: redemption.error,
+        },
+        { status: 503, headers: { "Cache-Control": "no-store" } }
+      );
     }
 
     return NextResponse.json(
@@ -368,7 +396,7 @@ export async function GET(request: NextRequest) {
           merchant: decodedReceipt.merchant.toBase58(),
           mint: decodedVault.mint.toBase58(),
           mintVerificationMode,
-          replayStore: claim.storeMode,
+          replayStore: redemption.storeMode,
           amountSettled: decodedReceipt.amount.toString(),
           canonicalPreimage: preimage,
           requestHashHex: decodedReceipt.requestHashHex,

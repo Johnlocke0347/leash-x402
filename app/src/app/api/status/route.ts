@@ -10,8 +10,10 @@ import {
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+export const maxDuration = 60;
 
 const PUBLIC_DEVNET_ENDPOINT = "https://api.devnet.solana.com";
+const STATUS_RPC_TIMEOUT_MS = 10_000;
 
 export async function GET() {
   const rpcUrl =
@@ -45,9 +47,12 @@ export async function GET() {
     const faucetKp = loadServerFaucetKeypair();
     if (faucetKp) {
       const connection = new Connection(rpcUrl, "confirmed");
-      const lamports = await connection
-        .getBalance(faucetKp.publicKey, "confirmed")
-        .catch(() => null);
+      const lamports = await Promise.race([
+        connection.getBalance(faucetKp.publicKey, "confirmed"),
+        new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), STATUS_RPC_TIMEOUT_MS)
+        ),
+      ]).catch(() => null);
       faucetDiagnostics = {
         configured: true,
         pubkey: faucetKp.publicKey.toBase58(),
