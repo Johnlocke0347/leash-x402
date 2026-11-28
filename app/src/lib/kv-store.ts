@@ -214,7 +214,22 @@ export async function redeemReceiptAtomically(
       storeMode: AtomicStoreMode;
     }
 > {
-  const storeMode = getAtomicStoreMode();
+  const creds = getRedisCredentials();
+  const storeMode: AtomicStoreMode = creds
+    ? "upstash_redis"
+    : "in_memory_fallback";
+
+  if (Boolean(process.env.VERCEL) && !creds) {
+    return {
+      ok: false,
+      reason: "store_unavailable",
+      httpStatus: 503,
+      error:
+        "Replay protection store unavailable (failing closed): UPSTASH_REDIS_REST_URL/TOKEN or KV_REST_API_URL/TOKEN must be configured on Vercel.",
+      storeMode,
+    };
+  }
+
   try {
     const acquired = await acquireAtomicLock(replayKey, ttlSeconds);
     if (!acquired) {

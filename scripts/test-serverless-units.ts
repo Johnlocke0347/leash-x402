@@ -316,10 +316,47 @@ async function run(): Promise<void> {
       assert.strictEqual(redemptionOnNetErr.httpStatus, 503);
     }
 
+    // Also test VERCEL=1 with missing Redis credentials -> MUST fail closed (HTTP 503)
+    clearRedisEnv();
+    process.env.VERCEL = "1";
+    const redemptionOnVercelNoRedis = await redeemReceiptAtomically(
+      "leash:x402:receipt:vercel-unconfigured-redis",
+      1800
+    );
+    assert.strictEqual(
+      redemptionOnVercelNoRedis.ok,
+      false,
+      "VERCEL=1 without Redis credentials MUST fail closed instead of falling back to in-memory Map"
+    );
+    if (!redemptionOnVercelNoRedis.ok) {
+      assert.strictEqual(redemptionOnVercelNoRedis.reason, "store_unavailable");
+      assert.strictEqual(redemptionOnVercelNoRedis.httpStatus, 503);
+    }
+
+    // Confirm non-Vercel local dev still preserves in-memory fallback
+    delete process.env.VERCEL;
+    resetInMemoryStoreForTests();
+    const localRedemption1 = await redeemReceiptAtomically(
+      "leash:x402:receipt:local-fallback-test",
+      1800
+    );
+    assert.strictEqual(localRedemption1.ok, true);
+    assert.strictEqual(localRedemption1.storeMode, "in_memory_fallback");
+    const localRedemption2 = await redeemReceiptAtomically(
+      "leash:x402:receipt:local-fallback-test",
+      1800
+    );
+    assert.strictEqual(localRedemption2.ok, false);
+    if (!localRedemption2.ok) {
+      assert.strictEqual(localRedemption2.reason, "already_redeemed");
+      assert.strictEqual(localRedemption2.httpStatus, 402);
+    }
+
     // Restore live mock URL
     process.env.UPSTASH_REDIS_REST_URL = baseUrl;
+    process.env.UPSTASH_REDIS_REST_TOKEN = mockToken;
     console.log(
-      "  [PASS] 3. Redis HTTP 500 & ECONNREFUSED network errors fail closed (HTTP 503, never 200 OK)"
+      "  [PASS] 3. Redis HTTP 500, ECONNREFUSED & VERCEL=1 missing-Redis all fail closed (HTTP 503, never 200 OK)"
     );
 
     // -------------------------------------------------------------------------

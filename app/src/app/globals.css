@@ -120,7 +120,8 @@ a:hover {
   padding: 5px 10px;
 }
 
-.rpc-box label {
+.rpc-box label,
+.rpc-label {
   font-size: 0.72rem;
   font-weight: 600;
   text-transform: uppercase;
@@ -128,13 +129,10 @@ a:hover {
   color: var(--ink-muted);
 }
 
-.rpc-input {
-  background: transparent;
-  border: none;
+.rpc-host {
   color: var(--ink-primary);
   font-size: 0.79rem;
-  width: 235px;
-  outline: none;
+  white-space: nowrap;
 }
 
 /* Status Strip */

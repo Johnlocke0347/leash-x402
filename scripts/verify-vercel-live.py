@@ -231,6 +231,14 @@ def main() -> None:
             timeout=20_000,
         )
 
+        # Assert masked DEVNET RPC badge has zero query string / API key leak
+        rpc_badge_text = page.locator("#rpc-host-value").inner_text().strip()
+        print(f"Verified DEVNET RPC badge: {rpc_badge_text}")
+        if "?api" in rpc_badge_text or "api-key" in rpc_badge_text or "/" in rpc_badge_text:
+            raise RuntimeError(
+                f"Unmasked RPC URL/key leaked in #rpc-host-value: {rpc_badge_text}"
+            )
+
         # Screenshot 1: Tight element screenshot of ONLY the red-vs-green SVG architecture card
         arch_card = page.locator("#architecture-diagram-section")
         arch_card.scroll_into_view_if_needed()
@@ -265,8 +273,15 @@ def main() -> None:
         page.click("#btn-refresh-state")
         page.wait_for_timeout(500)
 
-        # Screenshot 2: Top status bar (all pills) + Step 2 HTTP 200 OK + Step 3 HTTP 402 replay rejection
-        scroll_element_near_top(page, ".status-strip", top_margin_px=14)
+        # Screenshot 2: Header + DEVNET RPC badge + all 5 green pills + Step 3 402 + Step 2 200 OK
+        page.evaluate(
+            """() => {
+                window.scrollTo(0, 0);
+                const tl = document.querySelector('#protocol-trace-list');
+                if (tl) tl.scrollTop = 0;
+            }"""
+        )
+        page.wait_for_timeout(350)
         shot2 = os.path.join(out_dir, "02-live-settled-and-replay.png")
         page.screenshot(path=shot2, full_page=False)
         print(f"[2/4] Saved settled 200 + replay 402 -> {shot2}")

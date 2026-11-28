@@ -114,6 +114,15 @@ function shortKey(key: string): string {
   return `${key.slice(0, 6)}...${key.slice(-6)}`;
 }
 
+function formatRpcHost(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return parsed.host || "devnet-rpc";
+  } catch {
+    return "devnet-rpc";
+  }
+}
+
 function explorerTxUrl(sig: string): string {
   return `https://explorer.solana.com/tx/${sig}?cluster=devnet`;
 }
@@ -164,7 +173,7 @@ async function signAndConfirmBrowserTx(
 }
 
 export default function JudgeSandbox() {
-  const [rpcUrl, setRpcUrl] = useState<string>(DEFAULT_DEVNET_RPC);
+  const rpcUrl = DEFAULT_DEVNET_RPC;
   const [serverStatus, setServerStatus] = useState<ServerStatusPayload | null>(
     null
   );
@@ -1270,16 +1279,11 @@ export default function JudgeSandbox() {
             </p>
           </div>
 
-          <div className="rpc-box">
-            <label htmlFor="rpc-endpoint-input">Devnet RPC</label>
-            <input
-              id="rpc-endpoint-input"
-              className="rpc-input mono"
-              type="url"
-              value={rpcUrl}
-              onChange={(e) => setRpcUrl(e.target.value)}
-              spellCheck={false}
-            />
+          <div className="rpc-box" id="devnet-rpc-pill">
+            <span className="rpc-label">DEVNET RPC</span>
+            <span id="rpc-host-value" className="rpc-host mono">
+              {formatRpcHost(rpcUrl)}
+            </span>
           </div>
         </div>
 
